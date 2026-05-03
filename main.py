@@ -7,14 +7,18 @@ import re
 from fastapi import FastAPI, Query, Response
 from prometheus_client import CollectorRegistry, Gauge, generate_latest
 from onvif import ONVIFCamera
+import urllib.parse
 import datetime
 
 app = FastAPI(title="ONVIF Exporter")
 
 # --- 配置区 ---
-MAX_CONCURRENCY = 3  # 最大并发检测数（避免算力过载）
-CACHE_TTL = 50  # 缓存时间（秒），略小于 Prometheus 的 60s 抓取间隔
-BLACK_THRESHOLD = 15  # 黑屏检测阈值（0-255，平均像素亮度低于此判定为黑屏）
+# 最大并发检测数（避免算力过载）
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "3"))
+# 缓存时间（秒），略小于 Prometheus 的 60s 抓取间隔
+CACHE_TTL = int(os.getenv("CACHE_TTL", "50"))
+# 黑屏检测阈值（0-255，平均像素亮度低于此判定为黑屏）
+BLACK_THRESHOLD = int(os.getenv("BLACK_THRESHOLD", "15"))
 
 # --- 全局状态 ---
 semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
@@ -93,10 +97,6 @@ def sync_detect_stream(stream_uri: str):
 
     # 返回这 7 个指标
     return stream_exists, is_black, audio_volume_db, brightness, contrast, saturation, rb_ratio
-
-
-import urllib.parse
-import datetime
 
 
 def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
