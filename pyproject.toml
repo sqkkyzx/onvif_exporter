@@ -1,0 +1,12 @@
+[project]
+name = "onvif-exporter"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "prometheus-client",
+    "onvif-zeep",
+    "opencv-python-headless",
+    "ffmpeg-python"
+]
