@@ -4,6 +4,9 @@ import cv2
 import ffmpeg
 import os
 import re
+import gc
+
+import random
 from fastapi import FastAPI, Query, Response
 from prometheus_client import CollectorRegistry, Gauge, generate_latest
 from onvif import ONVIFCamera
@@ -41,8 +44,9 @@ def sync_detect_stream(stream_uri: str):
     rb_ratio = 1.0  # 红蓝偏色比，默认 1.0
 
     try:
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;5000"
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|threads;1|timeout;3000"
         cap = cv2.VideoCapture(stream_uri)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
         if cap.isOpened():
             ret, frame = cap.read()
@@ -94,6 +98,13 @@ def sync_detect_stream(stream_uri: str):
 
     except Exception as e:
         print(f"流检测异常: {e}")
+
+    finally:
+        if 'cap' in locals():
+            cap.release()
+        # 显式删除局部变量引用，辅助垃圾回收
+        if 'frame' in locals():
+            del frame
 
     # 返回这 7 个指标
     return stream_exists, is_black, audio_volume_db, brightness, contrast, saturation, rb_ratio
@@ -274,7 +285,8 @@ async def perform_probe(target: str, user: str, password: str, port: int) -> byt
 
     except Exception as e:
         print(f"探测目标 {target} 失败: {e}")
-
+    finally:
+        gc.collect()
     return generate_latest(registry)
 
 
@@ -297,6 +309,7 @@ async def probe(
 
     # 2. 排队获取并发锁
     async with semaphore:
+        await asyncio.sleep(random.uniform(0.5, 2.0))
         # 3. 第二层缓存检查（防止等待锁期间，前面的请求已经刷新了缓存）
         now = time.time()
         if cache_key in cache and (now - cache[cache_key]['time']) < CACHE_TTL:
