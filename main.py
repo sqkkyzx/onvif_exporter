@@ -95,23 +95,46 @@ def sync_detect_stream(stream_uri: str):
     return stream_exists, is_black, audio_volume_db, brightness, contrast, saturation, rb_ratio
 
 
+import urllib.parse
+import datetime
+
+
 def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
-    """阻塞型：连接 ONVIF 获取设备信息、媒体 URI 及各种附加状态"""
+    """阻塞型：连接 ONVIF 获取设备信息、媒体 URI 及各种附加状态 (含 0.0.0.0 地址纠错补丁)"""
     try:
+        # 1. 建立基础连接 (此时库会收到带有 0.0.0.0 的瞎扯 XML)
         cam = ONVIFCamera(target, port, user, password)
-        # 1. 获取基础设备信息
+
+        # ==========================================
+        # 核心补丁：暴力修正所有服务的注册地址
+        # ==========================================
+        fixed_netloc = f"{target}:{port}" if port != 80 else target
+
+        # 遍历 xaddrs 字典，把所有错乱的 IP (如 0.0.0.0, 127.0.0.1) 替换为我们确知的 Target
+        for namespace, wrong_url in cam.xaddrs.items():
+            parsed = urllib.parse.urlparse(wrong_url)
+            # 替换域名/IP和端口部分
+            cam.xaddrs[namespace] = parsed._replace(netloc=fixed_netloc).geturl()
+
+        # 同时修复主设备管理的 URL
+        if hasattr(cam.devicemgmt, 'url'):
+            parsed = urllib.parse.urlparse(cam.devicemgmt.url)
+            cam.devicemgmt.url = parsed._replace(netloc=fixed_netloc).geturl()
+        # ==========================================
+
+        # 获取基础设备信息
         dev_info = cam.devicemgmt.GetDeviceInformation()
 
-        # 2. 获取 MAC 地址 (从网络接口获取)
+        # 获取 MAC 地址
         mac_address = "unknown"
         try:
             net_interfaces = cam.devicemgmt.GetNetworkInterfaces()
             if net_interfaces:
                 mac_address = net_interfaces[0].Info.HwAddress
-        except Exception as e:
-            print(f"获取 {target} MAC 地址失败: {e}")
+        except Exception:
+            pass
 
-        # 3. 获取系统时间并计算时间漂移 (Drift)
+        # 获取系统时间并计算时间漂移
         time_drift = 0.0
         try:
             sys_time = cam.devicemgmt.GetSystemDateAndTime()
@@ -122,13 +145,14 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
                     utc.Time.Hour, utc.Time.Minute, utc.Time.Second,
                     tzinfo=datetime.timezone.utc
                 )
-                # 计算当前服务器时间与摄像头时间的差值（秒）
+                import time
                 time_drift = time.time() - cam_dt.timestamp()
-        except Exception as e:
-            print(f"获取 {target} 系统时间失败: {e}")
+        except Exception:
+            pass
 
-        # 4. 获取媒体流 URI 和视频编码参数
+        # 2. 创建媒体服务 (此时它会使用我们刚刚修正后的正确地址)
         media_service = cam.create_media_service()
+
         profiles = media_service.GetProfiles()
         if not profiles:
             raise Exception("未找到媒体配置文件 (Media Profiles)")
@@ -137,9 +161,19 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
         req = media_service.create_type('GetStreamUri')
         req.ProfileToken = token
         req.StreamSetup = {'Stream': 'RTP-Unicast', 'Transport': {'Protocol': 'RTSP'}}
+
+        # 获取原始 RTSP 流地址
         stream_uri = media_service.GetStreamUri(req).Uri
 
-        # 提取视频编码参数 (分辨率、帧率)
+        # 二次补丁：防止 RTSP 返回的地址也是 0.0.0.0
+        parsed_rtsp = urllib.parse.urlparse(stream_uri)
+        if parsed_rtsp.hostname in ['0.0.0.0', '127.0.0.1', 'localhost']:
+            # 保留它原有的 RTSP 端口 (通常是 554)，只替换 IP
+            rtsp_port = parsed_rtsp.port if parsed_rtsp.port else 554
+            fixed_rtsp_netloc = f"{target}:{rtsp_port}"
+            stream_uri = parsed_rtsp._replace(netloc=fixed_rtsp_netloc).geturl()
+
+        # 提取视频编码参数
         video_conf = profiles[0].VideoEncoderConfiguration
         video_metrics = {
             "width": video_conf.Resolution.Width,
@@ -148,7 +182,7 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
             "encoding": video_conf.Encoding
         }
 
-        # 5. 获取 PTZ 状态
+        # 3. 获取 PTZ 状态
         ptz_data = None
         try:
             ptz_service = cam.create_ptz_service()
@@ -159,7 +193,7 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
                 "zoom": status.Position.Zoom.x
             }
         except Exception:
-            pass # 不支持 PTZ 不报错
+            pass
 
         return dev_info, stream_uri, ptz_data, mac_address, time_drift, video_metrics
     except Exception as e:
