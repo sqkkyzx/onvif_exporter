@@ -86,11 +86,12 @@ jobs:
         if: always()
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          MIRROR_HOST: ${{ secrets.MIRROR_REGISTRY_HOST }}
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           
           if [ "${{ job.status }}" == "success" ]; then
-            MSG="#### ${{ github.repository }} \n\n > 构建状态：[成功 ✅](${{ env.RUN_URL }}) \n\n > 版本: v${{ env.VERSION }} \n\n > GHCR: ${{ env.GHCR_IMAGE }} \n\n > DockerHub: ${{ env.DOCKERHUB_IMAGE }}"          
+            MSG="#### ${{ github.repository }} \n\n > 构建状态：[成功 ✅](${{ env.RUN_URL }}) \n\n > 版本: v${{ env.VERSION }} \n\n > GHCR: ${{ env.GHCR_IMAGE }} \n\n > DockerHub: ${{ env.DOCKERHUB_IMAGE }}\n\n > 镜像地址: ${{ env.MIRROR_HOST }}/${{ env.DOCKERHUB_IMAGE }}"
             TITLE="✅ 构建成功！"
           else
             MSG="#### ${{ github.repository }} \n\n > 构建状态：[失败 ❌](${{ env.RUN_URL }}) \n\n > 版本: v${{ env.VERSION }} "
