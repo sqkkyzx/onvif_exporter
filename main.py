@@ -55,6 +55,8 @@ CACHE_TTL = int(os.getenv("CACHE_TTL", "90"))
 REFRESH_THRESHOLD = int(os.getenv("REFRESH_THRESHOLD", "60"))
 # 判定画面为“黑屏”的像素平均亮度界限（范围 0 - 255）。
 BLACK_THRESHOLD = int(os.getenv("BLACK_THRESHOLD", "15"))
+# 是否开启严格的 PTZ 全零异常检测 (默认 False，可通过 ENV 设为 True)
+STRICT_ZERO_PTZ_CHECK = os.getenv("STRICT_ZERO_PTZ_CHECK", "False").lower() in ("true", "1", "yes")
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -314,11 +316,20 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
         try:
             ptz_service = cam.create_ptz_service()
             ptz_status = ptz_service.GetStatus({'ProfileToken': token})
-            ptz_data = {
-                "pan": ptz_status.Position.PanTilt.x,
-                "tilt": ptz_status.Position.PanTilt.y,
-                "zoom": ptz_status.Position.Zoom.x
-            }
+
+            pan_val = ptz_status.Position.PanTilt.x
+            tilt_val = ptz_status.Position.PanTilt.y
+            zoom_val = ptz_status.Position.Zoom.x
+
+            if STRICT_ZERO_PTZ_CHECK and pan_val == 0.0 and tilt_val == 0.0 and zoom_val == 0.0:
+                logger.warning(f"[{target}] PTZ 返回值全为 0.0，触发 STRICT_ZERO_PTZ_CHECK，判定为 PTZ 异常/不支持。")
+                ptz_data = None
+            else:
+                ptz_data = {
+                    "pan": pan_val,
+                    "tilt": tilt_val,
+                    "zoom": zoom_val
+                }
         except Exception as e:
             logger.error(f"PTZ 状态获取失败: {e}")
             pass
