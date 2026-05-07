@@ -46,9 +46,14 @@ APP_NAME, APP_VERSION, APP_DESC = get_project_metadata()
 # ==========================================
 # 2. 核心配置与环境变量
 # ==========================================
+
+# 同时执行拉取和分析视频流（OpenCV/FFmpeg）的最大任务数
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "3"))
+# 分析视频流（OpenCV/FFmpeg）缓存数据能存活的“最大寿命”（单位：秒）。
 CACHE_TTL = int(os.getenv("CACHE_TTL", "90"))
-REFRESH_THRESHOLD = int(os.getenv("REFRESH_THRESHOLD", "50"))
+# 触发后台更新任务的“时间临界点”（单位：秒）。
+REFRESH_THRESHOLD = int(os.getenv("REFRESH_THRESHOLD", "60"))
+# 判定画面为“黑屏”的像素平均亮度界限（范围 0 - 255）。
 BLACK_THRESHOLD = int(os.getenv("BLACK_THRESHOLD", "15"))
 
 # --- 鉴权环境变量 ---
@@ -347,15 +352,18 @@ async def cv_worker():
             gc.collect()
 
 
-
 @app.get("/probe", dependencies=[Depends(verify_auth)])
 async def probe(
         target: str = Query(..., description="摄像机IP地址"),
         user: str = Query("admin", description="ONVIF用户名"),
         password: str = Query(..., description="ONVIF密码"),
-        port: int = Query(80, description="ONVIF端口")
+        port: int = Query(80, description="ONVIF端口"),
+        # 🎯 新增：接收从 Prometheus Relabel 传过来的期望值参数
+        expected_pan: float | None = Query(None, description="期望的 Pan 坐标"),
+        expected_tilt: float | None = Query(None, description="期望的 Tilt 坐标"),
+        expected_zoom: float | None = Query(None, description="期望的 Zoom 焦距")
 ):
-    """双轨制抓取端点：实时返回 ONVIF，按需拉起 CV 异步缓存"""
+    """双轨制抓取端点：实时返回 ONVIF，按需拉起 CV 异步缓存，包含动态阈值比对"""
     registry = CollectorRegistry()
 
     # 初始化所有指标
@@ -367,10 +375,24 @@ async def probe(
     metric_video_height = Gauge('onvif_video_resolution_height', '分辨率高', registry=registry)
     metric_video_fps = Gauge('onvif_video_framerate_limit', '帧率限制', registry=registry)
     metric_focus_mode = Gauge('onvif_imaging_autofocus_enabled', '自动对焦开启(1=AUTO, 0=MANUAL)', registry=registry)
+
     metric_ptz_supported = Gauge('onvif_ptz_supported', '设备支持PTZ', registry=registry)
     metric_ptz_pan = Gauge('onvif_ptz_pan', '云台Pan', registry=registry)
     metric_ptz_tilt = Gauge('onvif_ptz_tilt', '云台Tilt', registry=registry)
     metric_ptz_zoom = Gauge('onvif_ptz_zoom', '变焦Zoom', registry=registry)
+
+    # 🎯 核心新增：注册期望值指标
+    metric_exp_pan = Gauge('onvif_ptz_expected_pan', '期望的云台Pan', registry=registry)
+    metric_exp_tilt = Gauge('onvif_ptz_expected_tilt', '期望的云台Tilt', registry=registry)
+    metric_exp_zoom = Gauge('onvif_ptz_expected_zoom', '期望的变焦Zoom', registry=registry)
+
+    # 只要 Prometheus 传了期望值，我们就原样将其作为独立 Metric 暴露出去
+    if expected_pan is not None:
+        metric_exp_pan.set(expected_pan)
+    if expected_tilt is not None:
+        metric_exp_tilt.set(expected_tilt)
+    if expected_zoom is not None:
+        metric_exp_zoom.set(expected_zoom)
 
     # CV 相关指标
     metric_stream_exists = Gauge('onvif_video_stream_exists', '视频流是否成功读取', registry=registry)
