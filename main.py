@@ -339,6 +339,57 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
         raise Exception(f"ONVIF交互失败: {e}")
 
 
+def sync_onvif_control(target: str, user: str, password: str, port: int,
+                       mode: str, pan: float, tilt: float, zoom: float, preset: str):
+    """阻塞型：发送 ONVIF PTZ 控制指令"""
+    try:
+        cam = ONVIFCamera(target, port, user, password)
+        fixed_netloc = f"{target}:{port}" if port != 80 else target
+
+        # 同样需要修正 WSDL 地址补丁，否则控制指令会发到 0.0.0.0 去
+        for namespace, wrong_url in cam.xaddrs.items():
+            parsed = urllib.parse.urlparse(wrong_url)
+            cam.xaddrs[namespace] = parsed._replace(netloc=fixed_netloc).geturl()
+
+        media_service = cam.create_media_service()
+        profiles = media_service.GetProfiles()
+        if not profiles:
+            raise Exception("未找到媒体配置文件，无法获取 ProfileToken")
+
+        token = profiles[0].token
+        ptz_service = cam.create_ptz_service()
+
+        if mode == "ptz":
+            # 绝对移动
+            req = ptz_service.create_type('AbsoluteMove')
+            req.ProfileToken = token
+            req.Position = {'PanTilt': {'x': pan, 'y': tilt}, 'Zoom': {'x': zoom}}
+            ptz_service.AbsoluteMove(req)
+            return f"AbsoluteMove 到 [Pan:{pan}, Tilt:{tilt}, Zoom:{zoom}] 成功"
+
+        elif mode == "move":
+            # 相对移动
+            req = ptz_service.create_type('RelativeMove')
+            req.ProfileToken = token
+            req.Translation = {'PanTilt': {'x': pan, 'y': tilt}, 'Zoom': {'x': zoom}}
+            ptz_service.RelativeMove(req)
+            return f"RelativeMove 偏移 [Pan:{pan}, Tilt:{tilt}, Zoom:{zoom}] 成功"
+
+        elif mode == "preset":
+            # 调用预置位
+            req = ptz_service.create_type('GotoPreset')
+            req.ProfileToken = token
+            req.PresetToken = preset
+            ptz_service.GotoPreset(req)
+            return f"GotoPreset [预置位:{preset}] 成功"
+
+        else:
+            raise ValueError(f"未知的 mode: {mode}")
+
+    except Exception as e:
+        logger.error(f"[{target}] PTZ 控制失败: {e}")
+        raise Exception(f"控制指令执行失败: {str(e)}")
+
 async def cv_worker():
     """后台工作协程：专门负责消耗资源的 CV 拉流解析"""
     loop = asyncio.get_running_loop()
@@ -489,6 +540,48 @@ async def probe(
         pass
 
     return Response(generate_latest(registry), media_type="text/plain")
+
+
+@app.get("/control", dependencies=[Depends(verify_auth)])
+async def control_ptz(
+        target: str = Query(..., description="摄像机IP地址"),
+        user: str = Query("admin", description="ONVIF用户名"),
+        password: str = Query(..., description="ONVIF密码"),
+        port: int = Query(80, description="ONVIF端口"),
+        mode: str = Query(..., description="控制模式: ptz, move, preset"),
+        pan: float | None = Query(None, description="Pan 坐标/偏移量"),
+        tilt: float | None = Query(None, description="Tilt 坐标/偏移量"),
+        zoom: float | None = Query(None, description="Zoom 焦距/偏移量"),
+        preset: str | None = Query(None, description="预置位Token (如 '1')")
+):
+    """
+    摄像机 PTZ 控制端点
+    - mode=ptz: 移动到绝对坐标，需提供 pan, tilt, zoom
+    - mode=move: 相对当前坐标偏移，需提供 pan, tilt, zoom
+    - mode=preset: 转到预置位，需提供 preset
+    """
+    # 1. 严格参数校验
+    if mode in ("ptz", "move"):
+        if pan is None or tilt is None or zoom is None:
+            raise HTTPException(status_code=400, detail=f"在 '{mode}' 模式下，pan, tilt, zoom 为必填项。")
+    elif mode == "preset":
+        if preset is None:
+            raise HTTPException(status_code=400, detail="在 'preset' 模式下，preset 为必填项。")
+    else:
+        raise HTTPException(status_code=400, detail="mode 必须是 ptz, move 或 preset。")
+
+    # 2. 扔到线程池执行控制指令 (由于是轻量级网络请求，复用线程池即可)
+    loop = asyncio.get_running_loop()
+    try:
+        # noinspection PyTypeChecker
+        result_msg = await loop.run_in_executor(
+            thread_pool,
+            sync_onvif_control,
+            target, user, password, port, mode, pan, tilt, zoom, preset
+        )
+        return {"status": "success", "target": target, "message": result_msg}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/metrics", dependencies=[Depends(verify_auth)])
