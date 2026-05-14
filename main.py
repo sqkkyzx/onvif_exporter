@@ -37,7 +37,7 @@ def get_project_metadata():
                 project.get("description", "ONVIF/CV Exporter for Prometheus")
             )
     except Exception as e:
-        logger.debug(f"Failed to load project metadata: {e}")
+        logging.getLogger("uvicorn.error").debug(f"Failed to load project metadata: {e}")
         # 兼容找不到文件的情况
         return "onvif-exporter", "dev", "ONVIF Exporter (Metadata Missing)"
 
@@ -48,15 +48,23 @@ APP_NAME, APP_VERSION, APP_DESC = get_project_metadata()
 # ==========================================
 
 # 同时执行拉取和分析视频流（OpenCV/FFmpeg）的最大任务数
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "3"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
 # 分析视频流（OpenCV/FFmpeg）缓存数据能存活的“最大寿命”（单位：秒）。
-CACHE_TTL = int(os.getenv("CACHE_TTL", "90"))
+CACHE_TTL = int(os.getenv("CACHE_TTL", "180"))
 # 触发后台更新任务的“时间临界点”（单位：秒）。
-REFRESH_THRESHOLD = int(os.getenv("REFRESH_THRESHOLD", "60"))
+REFRESH_THRESHOLD = int(os.getenv("REFRESH_THRESHOLD", "120"))
 # 判定画面为“黑屏”的像素平均亮度界限（范围 0 - 255）。
 BLACK_THRESHOLD = int(os.getenv("BLACK_THRESHOLD", "15"))
 # 是否开启严格的 PTZ 全零异常检测 (默认 False，可通过 ENV 设为 True)
 STRICT_ZERO_PTZ_CHECK = os.getenv("STRICT_ZERO_PTZ_CHECK", "False").lower() in ("true", "1", "yes")
+# CV 子进程执行多少个任务后重建。OpenCV/FFmpeg 在长生命周期进程里常见 native 内存缓慢增长。
+CV_PROCESS_MAX_TASKS = int(os.getenv("CV_PROCESS_MAX_TASKS", "25"))
+# CV 后台队列上限。Prometheus 高频 scrape 或大量 target 异常时，避免无限排队。
+CV_QUEUE_MAXSIZE = int(os.getenv("CV_QUEUE_MAXSIZE", str(MAX_CONCURRENCY * 4)))
+# CV 缓存最大目标数。防止 target 参数变化或动态发现导致字典无限增长。
+CV_CACHE_MAX_ENTRIES = int(os.getenv("CV_CACHE_MAX_ENTRIES", "256"))
+# 缓存清理间隔。清理超过 CACHE_TTL 的旧 target 数据。
+CV_CACHE_CLEAN_INTERVAL = int(os.getenv("CV_CACHE_CLEAN_INTERVAL", "120"))
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -101,10 +109,11 @@ def verify_auth(credentials: HTTPBasicCredentials | None = Depends(security)):
 # 全局状态池定义
 # ==========================================
 cv_cache = {}
-cv_queue = asyncio.Queue()
+cv_queue = None
 cv_probing_targets = set()
 process_pool = None
 thread_pool = None
+last_cv_cache_clean = 0.0
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -114,13 +123,17 @@ logger = logging.getLogger("uvicorn.error")
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global process_pool, thread_pool
+    global process_pool, thread_pool, cv_queue
     try:
         multiprocessing.set_start_method('spawn')
     except RuntimeError:
         pass
 
-    process_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENCY)
+    cv_queue = asyncio.Queue(maxsize=CV_QUEUE_MAXSIZE)
+    process_pool = ProcessPoolExecutor(
+        max_workers=MAX_CONCURRENCY,
+        max_tasks_per_child=CV_PROCESS_MAX_TASKS
+    )
     thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENCY * 3)
     workers = [asyncio.create_task(cv_worker()) for _ in range(MAX_CONCURRENCY)]
 
@@ -132,8 +145,10 @@ async def lifespan(app: FastAPI):
     ========================================================
     * 描述: {APP_DESC}
     * 进程池并发数: {MAX_CONCURRENCY} (Process Pool)
+    * CV 子进程任务上限: {CV_PROCESS_MAX_TASKS} tasks/child
     * 线程池并发数: {MAX_CONCURRENCY * 3} (Thread Pool)
-    * 缓存机制: {CACHE_TTL}s 过期 / {REFRESH_THRESHOLD}s 静默刷新
+    * 缓存机制: {CACHE_TTL}s 过期 / {REFRESH_THRESHOLD}s 静默刷新 / 最多 {CV_CACHE_MAX_ENTRIES} targets
+    * CV 队列上限: {CV_QUEUE_MAXSIZE}
     * HTTP 鉴权: {auth_status}
     ========================================================
     """
@@ -142,8 +157,9 @@ async def lifespan(app: FastAPI):
     yield
 
     for w in workers: w.cancel()
-    process_pool.shutdown(wait=False)
-    thread_pool.shutdown(wait=False)
+    await asyncio.gather(*workers, return_exceptions=True)
+    process_pool.shutdown(wait=False, cancel_futures=True)
+    thread_pool.shutdown(wait=False, cancel_futures=True)
 
 # ==========================================
 # FastAPI
@@ -153,15 +169,33 @@ app = FastAPI(
     version=APP_VERSION,
     description=APP_DESC,
     lifespan=lifespan,
-    docs_url="/docs" if not AUTH_USERNAME else None, # 开启鉴权时最好隐藏自动文档
+    docs_url="/docs" if not (AUTH_USERNAME and AUTH_PASSWORD) else None, # 开启鉴权时最好隐藏自动文档
     redoc_url=None
 )
+
+
+def build_authenticated_rtsp_uri(stream_uri: str, user: str, password: str):
+    """Safely inject RTSP credentials without duplicating an existing userinfo."""
+    parsed = urllib.parse.urlparse(stream_uri)
+    if parsed.scheme != "rtsp" or not parsed.hostname:
+        return stream_uri
+
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    userinfo = f"{urllib.parse.quote(user, safe='')}:{urllib.parse.quote(password, safe='')}"
+    netloc = f"{userinfo}@{hostname}"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+
+    return parsed._replace(netloc=netloc).geturl()
 
 
 def sync_detect_stream(stream_uri: str):
     """
     阻塞型：视频流质量检测 (重度 I/O 与 CPU)。
-    运行在独立子进程，OS物理回收内存。
+    运行在可定期重建的独立子进程中，降低 OpenCV/FFmpeg native 内存累积风险。
     修改为返回 dict，方便灵活调用。
     """
     result = {
@@ -209,7 +243,7 @@ def sync_detect_stream(stream_uri: str):
             try:
                 out, err = (
                     ffmpeg
-                    .input(stream_uri, t=1)
+                    .input(stream_uri, t=1, rtsp_transport='tcp', timeout=3000000, rw_timeout=3000000)
                     .filter('volumedetect')
                     .output('null', f='null')
                     .global_args('-timelimit', '4')
@@ -230,6 +264,27 @@ def sync_detect_stream(stream_uri: str):
         if 'frame' in locals(): del frame
 
     return result
+
+
+def cleanup_cv_cache(now: float):
+    """限制 CV 缓存增长，避免动态 target 或异常请求导致常驻内存持续上涨。"""
+    global last_cv_cache_clean
+    if now - last_cv_cache_clean < CV_CACHE_CLEAN_INTERVAL:
+        return
+
+    last_cv_cache_clean = now
+    expired_keys = [
+        key for key, entry in cv_cache.items()
+        if now - entry.get("time", 0) > CACHE_TTL
+    ]
+    for key in expired_keys:
+        cv_cache.pop(key, None)
+
+    overflow = len(cv_cache) - CV_CACHE_MAX_ENTRIES
+    if overflow > 0:
+        oldest_keys = sorted(cv_cache, key=lambda key: cv_cache[key].get("time", 0))[:overflow]
+        for key in oldest_keys:
+            cv_cache.pop(key, None)
 
 
 def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
@@ -408,8 +463,7 @@ async def cv_worker():
         except Exception as e:
             print(f"CV Worker 异常: {e}")
         finally:
-            if cache_key in cv_probing_targets:
-                cv_probing_targets.remove(cache_key)
+            cv_probing_targets.discard(cache_key)
             cv_queue.task_done()
             gc.collect()
 
@@ -503,14 +557,23 @@ async def probe(
         # 2. 异步慢轨：检查 CV 缓存并按需触发刷新
         # ==========================================
         now = time.time()
+        cleanup_cv_cache(now)
         cache_entry = cv_cache.get(cache_key)
         cache_age = now - cache_entry['time'] if cache_entry else float('inf')
 
-        # 如果 CV 缓存过期且尚未排队，丢入后台队列执行拉流分析
+        # 缓存达到刷新阈值且尚未排队时，后台刷新；旧缓存继续服务到 CACHE_TTL。
         if cache_age > REFRESH_THRESHOLD and cache_key not in cv_probing_targets:
             cv_probing_targets.add(cache_key)
-            auth_uri = stream_uri.replace("rtsp://", f"rtsp://{user}:{password}@")
-            cv_queue.put_nowait((cache_key, auth_uri))
+            auth_uri = build_authenticated_rtsp_uri(stream_uri, user, password)
+            try:
+                cv_queue.put_nowait((cache_key, auth_uri))
+            except asyncio.QueueFull:
+                cv_probing_targets.discard(cache_key)
+                logger.warning(
+                    "CV 队列已满，跳过本次后台刷新: target=%s queue_size=%s",
+                    cache_key,
+                    cv_queue.qsize()
+                )
 
         # 3. 组装 CV 数据 (不论后台是否在更新，先返回缓存的数据)
         if cache_age < CACHE_TTL and cache_entry:
@@ -587,7 +650,14 @@ async def control_ptz(
 @app.get("/metrics", dependencies=[Depends(verify_auth)])
 async def metrics():
     """Exporter 自身状态监控"""
-    return Response(f"# {APP_NAME} v{APP_VERSION} Core is running.\n", media_type="text/plain")
+    queue_size = cv_queue.qsize() if cv_queue else 0
+    body = (
+        f"# {APP_NAME} v{APP_VERSION} Core is running.\n"
+        f"onvif_exporter_cv_cache_entries {len(cv_cache)}\n"
+        f"onvif_exporter_cv_queue_size {queue_size}\n"
+        f"onvif_exporter_cv_probing_targets {len(cv_probing_targets)}\n"
+    )
+    return Response(body, media_type="text/plain")
 
 
 if __name__ == "__main__":
