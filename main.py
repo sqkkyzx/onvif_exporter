@@ -67,6 +67,8 @@ CV_CACHE_MAX_ENTRIES = int(os.getenv("CV_CACHE_MAX_ENTRIES", "256"))
 CV_CACHE_CLEAN_INTERVAL = int(os.getenv("CV_CACHE_CLEAN_INTERVAL", "120"))
 # 是否输出正常 HTTP 请求访问日志。默认关闭，避免 Prometheus 高频抓取刷屏。
 ACCESS_LOG_ENABLED = os.getenv("EXPORTER_ACCESS_LOG", "False").lower() in ("true", "1", "yes")
+# 是否输出完整 FFmpeg stderr。默认只输出最后几行关键错误，避免日志过长。
+FFMPEG_VERBOSE_ERROR = os.getenv("EXPORTER_FFMPEG_VERBOSE_ERROR", "False").lower() in ("true", "1", "yes")
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -195,6 +197,17 @@ def build_authenticated_rtsp_uri(stream_uri: str, user: str, password: str):
     return parsed._replace(netloc=netloc).geturl()
 
 
+def format_ffmpeg_error(exc: Exception):
+    stderr = getattr(exc, "stderr", None)
+    if stderr:
+        stderr_text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
+        lines = [line.strip() for line in stderr_text.splitlines() if line.strip()]
+        if FFMPEG_VERBOSE_ERROR:
+            return stderr_text.strip()
+        return " | ".join(lines[-8:]) if lines else str(exc)
+    return str(exc)
+
+
 def sync_detect_stream(stream_uri: str):
     """
     阻塞型：视频流质量检测 (重度 I/O 与 CPU)。
@@ -256,8 +269,10 @@ def sync_detect_stream(stream_uri: str):
                 match = re.search(r'mean_volume:\s+([-\d.]+)\s+dB', err_str)
                 if match:
                     result["audio_volume_db"] = float(match.group(1))
+            except ffmpeg.Error as e:
+                logger.error("FFmpeg 音频检测失败: %s", format_ffmpeg_error(e))
             except Exception as e:
-                logger.error(f"流检测进程异常: {e}")
+                logger.error("FFmpeg 音频检测异常: %s", e)
                 pass
 
     except Exception as e:
