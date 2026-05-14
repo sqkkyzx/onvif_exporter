@@ -65,6 +65,8 @@ CV_QUEUE_MAXSIZE = int(os.getenv("CV_QUEUE_MAXSIZE", str(MAX_CONCURRENCY * 4)))
 CV_CACHE_MAX_ENTRIES = int(os.getenv("CV_CACHE_MAX_ENTRIES", "256"))
 # 缓存清理间隔。清理超过 CACHE_TTL 的旧 target 数据。
 CV_CACHE_CLEAN_INTERVAL = int(os.getenv("CV_CACHE_CLEAN_INTERVAL", "120"))
+# 是否输出正常 HTTP 请求访问日志。默认关闭，避免 Prometheus 高频抓取刷屏。
+ACCESS_LOG_ENABLED = os.getenv("EXPORTER_ACCESS_LOG", "False").lower() in ("true", "1", "yes")
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -149,6 +151,7 @@ async def lifespan(app: FastAPI):
     * 线程池并发数: {MAX_CONCURRENCY * 3} (Thread Pool)
     * 缓存机制: {CACHE_TTL}s 过期 / {REFRESH_THRESHOLD}s 静默刷新 / 最多 {CV_CACHE_MAX_ENTRIES} targets
     * CV 队列上限: {CV_QUEUE_MAXSIZE}
+    * HTTP 访问日志: {"已开启" if ACCESS_LOG_ENABLED else "已关闭"}
     * HTTP 鉴权: {auth_status}
     ========================================================
     """
@@ -676,5 +679,6 @@ if __name__ == "__main__":
         port=9121,
         log_config=log_config,
         log_level="info",
+        access_log=ACCESS_LOG_ENABLED,
         server_header=False
     )
