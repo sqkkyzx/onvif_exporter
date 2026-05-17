@@ -257,11 +257,16 @@ def sync_detect_stream(stream_uri: str):
 
         if result["stream_exists"]:
             try:
+                audio_stream = ffmpeg.input(
+                    stream_uri,
+                    rtsp_transport='tcp',
+                    timeout=3000000,
+                    rw_timeout=3000000
+                ).audio
                 out, err = (
-                    ffmpeg
-                    .input(stream_uri, t=1, rtsp_transport='tcp', timeout=3000000, rw_timeout=3000000)
+                    audio_stream
                     .filter('volumedetect')
-                    .output('null', f='null')
+                    .output('pipe:', format='null', t=1)
                     .global_args('-timelimit', '4')
                     .run(capture_stderr=True, capture_stdout=True, quiet=True)
                 )
