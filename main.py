@@ -10,6 +10,7 @@ import re
 import gc
 import random
 import secrets
+import subprocess
 import urllib.parse
 import datetime
 import multiprocessing
@@ -69,6 +70,10 @@ CV_CACHE_CLEAN_INTERVAL = int(os.getenv("CV_CACHE_CLEAN_INTERVAL", "120"))
 ACCESS_LOG_ENABLED = os.getenv("EXPORTER_ACCESS_LOG", "False").lower() in ("true", "1", "yes")
 # 是否输出完整 FFmpeg stderr。默认只输出最后几行关键错误，避免日志过长。
 FFMPEG_VERBOSE_ERROR = os.getenv("EXPORTER_FFMPEG_VERBOSE_ERROR", "False").lower() in ("true", "1", "yes")
+# FFmpeg 音频采样秒数。volumedetect 需要实际解码音频样本，过短可能拿不到稳定值。
+FFMPEG_AUDIO_SAMPLE_SECONDS = float(os.getenv("FFMPEG_AUDIO_SAMPLE_SECONDS", "2"))
+# Python 侧强制超时，避免 RTSP/FFmpeg 在异常设备上无限卡住。
+FFMPEG_AUDIO_TIMEOUT_SECONDS = float(os.getenv("FFMPEG_AUDIO_TIMEOUT_SECONDS", "8"))
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -208,6 +213,41 @@ def format_ffmpeg_error(exc: Exception):
     return str(exc)
 
 
+def detect_audio_volume_db(stream_uri: str) -> float | None:
+    """
+    Run FFmpeg volumedetect with a Python-side timeout.
+
+    Some FFmpeg builds do not support `-timelimit` on Windows, and some reject
+    `rw_timeout` for RTSP inputs. Keeping the FFmpeg arguments minimal and using
+    subprocess timeout is more portable while still preventing stuck probes.
+    """
+    audio_stream = ffmpeg.input(stream_uri, rtsp_transport='tcp').audio
+    command = (
+        audio_stream
+        .filter('volumedetect')
+        .output('pipe:', format='null', t=FFMPEG_AUDIO_SAMPLE_SECONDS)
+        .global_args('-nostdin')
+        .compile()
+    )
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=FFMPEG_AUDIO_TIMEOUT_SECONDS
+    )
+    err_str = completed.stderr or ""
+    match = re.search(r'mean_volume:\s+([-\d.]+)\s+dB', err_str)
+    if match:
+        return float(match.group(1))
+
+    if completed.returncode != 0:
+        logger.error("FFmpeg 音频检测失败: %s", format_ffmpeg_error(completed))
+    else:
+        logger.warning("FFmpeg 音频检测未解析到 mean_volume: %s", format_ffmpeg_error(completed))
+    return None
+
+
 def sync_detect_stream(stream_uri: str):
     """
     阻塞型：视频流质量检测 (重度 I/O 与 CPU)。
@@ -257,25 +297,13 @@ def sync_detect_stream(stream_uri: str):
 
         if result["stream_exists"]:
             try:
-                audio_stream = ffmpeg.input(
-                    stream_uri,
-                    rtsp_transport='tcp',
-                    timeout=3000000,
-                    rw_timeout=3000000
-                ).audio
-                out, err = (
-                    audio_stream
-                    .filter('volumedetect')
-                    .output('pipe:', format='null', t=1)
-                    .global_args('-timelimit', '4')
-                    .run(capture_stderr=True, capture_stdout=True, quiet=True)
-                )
-                err_str = err.decode('utf-8')
-                match = re.search(r'mean_volume:\s+([-\d.]+)\s+dB', err_str)
-                if match:
-                    result["audio_volume_db"] = float(match.group(1))
+                audio_volume_db = detect_audio_volume_db(stream_uri)
+                if audio_volume_db is not None:
+                    result["audio_volume_db"] = audio_volume_db
             except ffmpeg.Error as e:
                 logger.error("FFmpeg 音频检测失败: %s", format_ffmpeg_error(e))
+            except subprocess.TimeoutExpired:
+                logger.error("FFmpeg 音频检测超时: timeout=%ss", FFMPEG_AUDIO_TIMEOUT_SECONDS)
             except Exception as e:
                 logger.error("FFmpeg 音频检测异常: %s", e)
                 pass

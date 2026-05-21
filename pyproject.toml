@@ -1,6 +1,6 @@
 [project]
 name = "onvif-exporter"
-version = "0.2.3"
+version = "0.2.4"
 description = "ONVIF/CV Exporter for Prometheus"
 requires-python = ">=3.14"
 dependencies = [

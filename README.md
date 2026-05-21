@@ -82,6 +82,8 @@ services:
       - STRICT_ZERO_PTZ_CHECK=true # 开启严格 PTZ 零值拦截 (过滤假 PTZ 设备)
       - EXPORTER_ACCESS_LOG=false  # 是否输出正常 HTTP 请求访问日志
       - EXPORTER_FFMPEG_VERBOSE_ERROR=false # 是否输出完整 FFmpeg stderr
+      - FFMPEG_AUDIO_SAMPLE_SECONDS=2 # 音频音量检测采样时长
+      - FFMPEG_AUDIO_TIMEOUT_SECONDS=8 # 音频检测 FFmpeg 子进程超时
       # --- 安全控制 (可选) ---
       # - EXPORTER_AUTH_USERNAME=admin
       # - EXPORTER_AUTH_PASSWORD=secret
@@ -107,6 +109,8 @@ services:
 | `CV_CACHE_CLEAN_INTERVAL` | `120` | 清理过期 CV 缓存的间隔，单位秒。清理对象是超过 `CACHE_TTL` 的缓存项。 |
 | `EXPORTER_ACCESS_LOG` | `False` | 是否输出正常 HTTP 请求访问日志。默认关闭，避免 Prometheus 高频抓取时日志刷屏。设置为 `true`、`1` 或 `yes` 可打开。 |
 | `EXPORTER_FFMPEG_VERBOSE_ERROR` | `False` | 是否输出完整 FFmpeg stderr。默认只输出最后几行关键错误，避免日志过长；排查 RTSP 鉴权、超时、编码兼容问题时可设为 `true`。 |
+| `FFMPEG_AUDIO_SAMPLE_SECONDS` | `2` | FFmpeg `volumedetect` 音频采样时长，单位秒。采样越长越稳定，但 CV 后台刷新耗时也会增加。 |
+| `FFMPEG_AUDIO_TIMEOUT_SECONDS` | `8` | Python 侧强制终止音频检测 FFmpeg 子进程的超时时间，单位秒。用于避免异常 RTSP 流卡住 CV 子进程。 |
 | `EXPORTER_AUTH_USERNAME` | 未设置 | HTTP Basic Auth 用户名。只有同时设置用户名和密码时才开启鉴权。 |
 | `EXPORTER_AUTH_PASSWORD` | 未设置 | HTTP Basic Auth 密码。开启后 `/probe`、`/control`、`/metrics` 都需要认证，且自动隐藏 `/docs`。 |
 
