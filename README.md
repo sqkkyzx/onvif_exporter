@@ -291,7 +291,7 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `onvif_ptz_expected_zoom` | Gauge | `/probe` | 无 | 期望 Zoom 坐标。仅当请求参数 `expected_zoom` 存在时返回。 |
 | `onvif_video_stream_exists` | Gauge | `/probe` | 无 | 是否成功从 RTSP 流中读取首帧。`1` 表示成功，`0` 表示失败、缓存过期或尚未完成首次 CV 分析。 |
 | `onvif_video_is_black_screen` | Gauge | `/probe` | 无 | 黑屏判定。`1` 表示平均亮度低于 `BLACK_THRESHOLD`，`0` 表示未判定为黑屏。 |
-| `onvif_audio_mean_volume_db` | Gauge | `/probe` | 无 | FFmpeg `volumedetect` 计算得到的平均音量 dB。默认静音/未知值为 `-91.0`。 |
+| `onvif_audio_mean_volume_db` | Gauge | `/probe` | 无 | FFmpeg `volumedetect` 计算得到的平均音量 dB。默认静音/未知值为 `-99.0`。 |
 | `onvif_video_cv_brightness` | Gauge | `/probe` | 无 | 首帧灰度平均亮度，范围约 `0-255`。 |
 | `onvif_video_cv_contrast` | Gauge | `/probe` | 无 | 首帧灰度标准差，用于表示画面对比度。 |
 | `onvif_video_cv_saturation` | Gauge | `/probe` | 无 | HSV 饱和度通道平均值，用于观察画面色彩饱和程度。 |

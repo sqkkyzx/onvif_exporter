@@ -74,6 +74,8 @@ FFMPEG_VERBOSE_ERROR = os.getenv("EXPORTER_FFMPEG_VERBOSE_ERROR", "False").lower
 FFMPEG_AUDIO_SAMPLE_SECONDS = float(os.getenv("FFMPEG_AUDIO_SAMPLE_SECONDS", "2"))
 # Python 侧强制超时，避免 RTSP/FFmpeg 在异常设备上无限卡住。
 FFMPEG_AUDIO_TIMEOUT_SECONDS = float(os.getenv("FFMPEG_AUDIO_TIMEOUT_SECONDS", "8"))
+# 音频未检测成功或缓存未生成时的哨兵值。
+AUDIO_UNKNOWN_VOLUME_DB = -99.0
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -257,7 +259,7 @@ def sync_detect_stream(stream_uri: str):
     result = {
         "stream_exists": False,
         "is_black": False,
-        "audio_volume_db": -91.0,
+        "audio_volume_db": AUDIO_UNKNOWN_VOLUME_DB,
         "brightness": 0.0,
         "contrast": 0.0,
         "saturation": 0.0,
@@ -641,7 +643,7 @@ async def probe(
             # 缓存彻底过期或首次请求，设为默认安全值 (不打断监控，但标记为无流)
             metric_stream_exists.set(0)
             metric_is_black.set(0)
-            metric_audio_vol.set(-91.0)
+            metric_audio_vol.set(AUDIO_UNKNOWN_VOLUME_DB)
             metric_cv_brightness.set(0)
             metric_cv_contrast.set(0)
             metric_cv_saturation.set(0)
