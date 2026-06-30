@@ -90,6 +90,14 @@ FFMPEG_AUDIO_SAMPLE_SECONDS = float(os.getenv("FFMPEG_AUDIO_SAMPLE_SECONDS", "2"
 FFMPEG_AUDIO_TIMEOUT_SECONDS = float(os.getenv("FFMPEG_AUDIO_TIMEOUT_SECONDS", "8"))
 # 音频未检测成功或缓存未生成时的哨兵值。
 AUDIO_UNKNOWN_VOLUME_DB = -99.0
+# OpenCV 侧 RTSP 缓冲帧数。部分 FFmpeg 后端可能不完全遵守该参数，但保留为可调项。
+CAP_PROP_BUFFERSIZE = max(0, int(os.getenv("CAP_PROP_BUFFERSIZE", "1")))
+# CV 单次检测最多尝试读取多少帧。RTSP/HEVC 偶发丢参考帧时，单帧读取容易误判为无流。
+CV_READ_ATTEMPTS = max(1, int(os.getenv("CV_READ_ATTEMPTS", "3")))
+# 多次读帧之间的等待时间，给 RTSP/解码器一点时间等到可解码帧。
+CV_READ_RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("CV_READ_RETRY_DELAY_SECONDS", "0.3")))
+# 选流时优先使用 H.264。HEVC/H.265 更容易触发 OpenCV/FFmpeg 解码抖动和更高 CPU 占用。
+PREFER_H264_STREAM = os.getenv("PREFER_H264_STREAM", "True").lower() in ("true", "1", "yes")
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -171,6 +179,8 @@ async def lifespan(app: FastAPI):
     * 描述: {APP_DESC}
     * CV 分析进程并发数: {CV_MAX_CONCURRENCY} (Process Pool)
     * CV 子进程任务上限: {CV_PROCESS_MAX_TASKS} tasks/child
+    * CV 单次读帧尝试: {CV_READ_ATTEMPTS} 次 / 间隔 {CV_READ_RETRY_DELAY_SECONDS}s / buffer={CAP_PROP_BUFFERSIZE}
+    * ONVIF 选流策略: {"优先 H.264" if PREFER_H264_STREAM else "仅按最低分辨率"}
     * ONVIF 线程并发数: {ONVIF_MAX_CONCURRENCY} (Thread Pool)
     * 缓存机制: {CACHE_TTL}s 过期 / {REFRESH_THRESHOLD}s 静默刷新 / 最多 {CV_CACHE_MAX_ENTRIES} targets
     * CV 队列上限: {CV_QUEUE_MAXSIZE}
@@ -284,11 +294,23 @@ def sync_detect_stream(stream_uri: str):
     try:
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|threads;1|timeout;3000"
         cap = cv2.VideoCapture(stream_uri)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if CAP_PROP_BUFFERSIZE > 0:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, CAP_PROP_BUFFERSIZE)
 
         if cap.isOpened():
-            ret, frame = cap.read()
-            if ret:
+            frame = None
+            for attempt in range(1, CV_READ_ATTEMPTS + 1):
+                ret, candidate_frame = cap.read()
+                if ret and candidate_frame is not None and candidate_frame.size > 0:
+                    frame = candidate_frame
+                    break
+
+                if candidate_frame is not None:
+                    del candidate_frame
+                if attempt < CV_READ_ATTEMPTS and CV_READ_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(CV_READ_RETRY_DELAY_SECONDS)
+
+            if frame is not None:
                 result["stream_exists"] = True
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -382,18 +404,43 @@ def get_profile_resolution(profile) -> tuple[int, int] | None:
     return width, height
 
 
-def select_lowest_resolution_profile(profiles):
-    profiles_with_resolution = [
-        (resolution[0] * resolution[1], index, profile)
-        for index, profile in enumerate(profiles)
-        if (resolution := get_profile_resolution(profile)) is not None
-    ]
-    if profiles_with_resolution:
-        return min(profiles_with_resolution, key=lambda item: (item[0], item[1]))[2]
+def get_profile_encoding(profile) -> str:
+    video_conf = getattr(profile, "VideoEncoderConfiguration", None)
+    if video_conf is None:
+        return ""
 
-    for profile in profiles:
-        if getattr(profile, "VideoEncoderConfiguration", None) is not None:
-            return profile
+    encoding = getattr(video_conf, "Encoding", "")
+    return str(encoding or "").upper().replace(".", "").replace("-", "")
+
+
+def get_profile_codec_priority(profile) -> int:
+    if not PREFER_H264_STREAM:
+        return 0
+
+    encoding = get_profile_encoding(profile)
+    if encoding in ("H264", "AVC"):
+        return 0
+    if encoding and encoding not in ("H265", "HEVC"):
+        return 1
+    if not encoding:
+        return 2
+    return 3
+
+
+def select_lowest_resolution_profile(profiles):
+    profiles_with_video = [
+        (
+            get_profile_codec_priority(profile),
+            resolution[0] * resolution[1] if resolution is not None else sys.maxsize,
+            index,
+            profile
+        )
+        for index, profile in enumerate(profiles)
+        if getattr(profile, "VideoEncoderConfiguration", None) is not None
+        for resolution in [get_profile_resolution(profile)]
+    ]
+    if profiles_with_video:
+        return min(profiles_with_video, key=lambda item: (item[0], item[1], item[2]))[3]
 
     return profiles[0]
 
@@ -787,6 +834,10 @@ async def metrics():
         f"onvif_exporter_cv_max_concurrency {CV_MAX_CONCURRENCY}\n"
         f"onvif_exporter_onvif_max_concurrency {ONVIF_MAX_CONCURRENCY}\n"
         f"onvif_exporter_cv_queue_capacity {CV_QUEUE_MAXSIZE}\n"
+        f"onvif_exporter_cap_prop_buffersize {CAP_PROP_BUFFERSIZE}\n"
+        f"onvif_exporter_cv_read_attempts {CV_READ_ATTEMPTS}\n"
+        f"onvif_exporter_cv_read_retry_delay_seconds {CV_READ_RETRY_DELAY_SECONDS}\n"
+        f"onvif_exporter_prefer_h264_stream {1 if PREFER_H264_STREAM else 0}\n"
         f"onvif_exporter_cv_cache_entries {len(cv_cache)}\n"
         f"onvif_exporter_cv_queue_size {queue_size}\n"
         f"onvif_exporter_cv_probing_targets {len(cv_probing_targets)}\n"
