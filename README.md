@@ -16,6 +16,7 @@
 
 * **🚀 双轨制解耦架构**: ONVIF 轻量网络请求与重度 CV 视频流解码分离。即便视频流完全卡死，也能保证监控设备在线状态及基础参数（如 PTZ）的实时返回，绝不超时假死。
 * **🛡️ 进程级内存隔离与回收 (OOM Protection)**: 针对 4K 级高分辨率视频监控，彻底抛弃线程池解码。将底层 C++ 库（OpenCV/FFmpeg）封装进独立进程池，并定期重建 CV 子进程，降低 native 内存长期累积导致卡顿的风险。
+* **📉 自动低分辨率取流**: 通过 ONVIF `GetProfiles()` 读取所有媒体 Profile，默认选择分辨率最小的一路 RTSP 流进行 CV 分析，降低边缘节点 CPU 与内存压力。
 * **🎯 动态期望阈值巡检**: 独创的 Label 映射魔法。支持为成百上千个摄像头单独下发 `expected_pan/tilt/zoom` 期望坐标，一旦设备被人为恶意扭动导致偏离，即可触发精准告警。
 * **👁️ CV 画面与硬件故障分析**:
 * **黑屏/遮挡**: 基于灰度计算的图像异常告警。
@@ -41,11 +42,12 @@ docker run -d \
   --name onvif-exporter \
   -p 9121:9121 \
   --restart unless-stopped \
-  -e MAX_CONCURRENCY=2 \
+  -e CV_MAX_CONCURRENCY=1 \
+  -e ONVIF_MAX_CONCURRENCY=4 \
   -e CACHE_TTL=180 \
   -e REFRESH_THRESHOLD=120 \
   -e CV_PROCESS_MAX_TASKS=25 \
-  -e CV_QUEUE_MAXSIZE=8 \
+  -e CV_QUEUE_MAXSIZE=2 \
   -e CV_CACHE_MAX_ENTRIES=256 \
   -e CV_CACHE_CLEAN_INTERVAL=120 \
   -e BLACK_THRESHOLD=15 \
@@ -71,11 +73,12 @@ services:
     restart: unless-stopped
     environment:
       # --- 核心性能调优 ---
-      - MAX_CONCURRENCY=2           # 视频流解码最大并发进程数，4G 内存建议 1-2
+      - CV_MAX_CONCURRENCY=1        # 视频流解码最大并发进程数，2C2G/低内存设备建议固定 1
+      - ONVIF_MAX_CONCURRENCY=4     # ONVIF 网络请求线程并发，独立于重内存 CV 分析
       - CACHE_TTL=180               # 视频分析缓存最大寿命 (秒)
       - REFRESH_THRESHOLD=120       # 触发后台静默刷新的临界时间 (秒)
       - CV_PROCESS_MAX_TASKS=25     # 每个 CV 子进程处理多少个任务后重建
-      - CV_QUEUE_MAXSIZE=8          # CV 后台队列上限，默认 MAX_CONCURRENCY * 4
+      - CV_QUEUE_MAXSIZE=2          # CV 后台队列上限，默认 CV_MAX_CONCURRENCY * 2
       - CV_CACHE_MAX_ENTRIES=256    # CV 缓存最多保留多少个 target
       - CV_CACHE_CLEAN_INTERVAL=120 # CV 过期缓存清理间隔 (秒)
       - BLACK_THRESHOLD=15         # 黑屏判定阈值 (0-255)
@@ -90,21 +93,46 @@ services:
 
 ```
 
+### 方式三：Debian LXC 二进制运行
+
+每次推送新版后，GitHub Release 会附带 Linux x86_64 二进制压缩包：
+
+```text
+onvif-exporter-linux-x86_64-vX.Y.Z.tar.gz
+```
+
+在 Debian LXC 里安装运行时依赖并启动：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg
+
+tar -xzf onvif-exporter-linux-x86_64-vX.Y.Z.tar.gz
+cd onvif-exporter-linux-x86_64-vX.Y.Z
+chmod +x ./onvif-exporter
+
+CV_MAX_CONCURRENCY=1 ONVIF_MAX_CONCURRENCY=4 ./onvif-exporter
+```
+
+二进制内置 Python 运行时和 Python 依赖；`ffmpeg` 仍使用系统命令，用于音频音量检测。服务默认监听 `0.0.0.0:9121`。
+
 ---
 
 ## ⚙️ 环境变量说明
 
-以下环境变量均为可选；不设置时使用默认值。默认值按 4G 内存、跨公网拉取 RTSP 画面、20-100ms 延迟的保守场景设计，优先保证长期运行稳定。
+以下环境变量均为可选；不设置时使用默认值。默认值按低内存边缘节点、跨公网拉取 RTSP 画面、20-100ms 延迟的保守场景设计，优先限制内存峰值并保证长期运行稳定。
 
 | 环境变量 | 默认值 | 用法 |
 | --- | --- | --- |
-| `MAX_CONCURRENCY` | `2` | CV 视频流分析的最大并发数，同时也是 CV worker 数量。4G 内存建议 `1-2`；值越大，并发越高，但 CPU、内存、公网带宽和摄像机 RTSP 连接压力也越大。 |
+| `CV_MAX_CONCURRENCY` | `1` | CV 视频流分析的最大并发数，同时也是 CV worker 和 CV 子进程数量。2C2G/低内存设备建议保持 `1`；值越大，并发越高，但 CPU、内存、公网带宽和摄像机 RTSP 连接压力也越大。 |
+| `MAX_CONCURRENCY` | 未设置 | 旧版兼容别名。未设置 `CV_MAX_CONCURRENCY` 时才会读取它；新部署建议使用 `CV_MAX_CONCURRENCY`。 |
+| `ONVIF_MAX_CONCURRENCY` | `4` | ONVIF 协议交互线程并发数。ONVIF 请求主要是网络 I/O，和重内存 CV 分析分开控制，避免降低视频分析并发后基础探测也被过度限制。 |
 | `CACHE_TTL` | `180` | CV 分析结果最大可复用时间，单位秒。超过该时间后 `/probe` 会返回默认 CV 指标，直到后台刷新完成。 |
 | `REFRESH_THRESHOLD` | `120` | CV 缓存达到多少秒后触发后台静默刷新，单位秒。建议小于 `CACHE_TTL`，这样可以在缓存彻底过期前提前刷新。 |
 | `BLACK_THRESHOLD` | `15` | 黑屏判定亮度阈值，范围 `0-255`。平均灰度低于该值时 `onvif_video_is_black_screen=1`。夜间红外场景可适当调低。 |
 | `STRICT_ZERO_PTZ_CHECK` | `False` | 是否启用严格 PTZ 全零拦截。设置为 `true`、`1` 或 `yes` 时，如果设备返回 `pan=0, tilt=0, zoom=0`，会判定为 PTZ 异常/不支持。 |
 | `CV_PROCESS_MAX_TASKS` | `25` | 每个 CV 子进程最多处理多少次视频分析任务后自动重建。用于释放 OpenCV/FFmpeg 可能累积的 native 内存。设置太小会增加进程重建开销，设置太大则内存回收变慢。 |
-| `CV_QUEUE_MAXSIZE` | `MAX_CONCURRENCY * 4` | CV 后台刷新队列最大长度。队列满时会跳过本次后台刷新，避免请求堆积导致内存上涨。 |
+| `CV_QUEUE_MAXSIZE` | `CV_MAX_CONCURRENCY * 2` | CV 后台刷新队列最大长度。队列满时会跳过本次后台刷新，避免请求堆积导致内存上涨。 |
 | `CV_CACHE_MAX_ENTRIES` | `256` | CV 缓存最多保留多少个 target。适合限制动态 target 或异常请求造成的缓存字典增长。 |
 | `CV_CACHE_CLEAN_INTERVAL` | `120` | 清理过期 CV 缓存的间隔，单位秒。清理对象是超过 `CACHE_TTL` 的缓存项。 |
 | `EXPORTER_ACCESS_LOG` | `False` | 是否输出正常 HTTP 请求访问日志。默认关闭，避免 Prometheus 高频抓取时日志刷屏。设置为 `true`、`1` 或 `yes` 可打开。 |
@@ -116,10 +144,11 @@ services:
 
 ### 调参建议
 
-* 4G 内存机器建议 `MAX_CONCURRENCY=1` 或 `2`。如果摄像头是 4K、高码率或公网质量不稳，先用 `1`。
+* 2C2G、Wyse 3040 这类边缘节点建议 `CV_MAX_CONCURRENCY=1`、`CV_QUEUE_MAXSIZE=2`。程序会默认从 ONVIF 媒体 Profile 中选择分辨率最小的一路 RTSP 流用于 CV 分析。
+* 4G 内存机器可以按现场情况把 `CV_MAX_CONCURRENCY` 调到 `2`。如果摄像头是 4K、高码率或公网质量不稳，仍然先用 `1`。
 * 默认缓存策略是 stale-while-revalidate：`REFRESH_THRESHOLD=120` 后允许后台刷新，但旧 CV 数据最多只复用到 `CACHE_TTL=180`。这样既避免每次 scrape 都拉公网 RTSP，也避免缓存长期不更新。
 * 如果程序运行几小时后变卡，优先把 `CV_PROCESS_MAX_TASKS` 调小到 `10-20`，让 CV 子进程更频繁回收。
-* 如果 `/metrics` 中 `onvif_exporter_cv_queue_size` 长期接近 `CV_QUEUE_MAXSIZE`，说明视频分析跟不上抓取速度。可以增大 `REFRESH_THRESHOLD`、降低 Prometheus `scrape_interval` 频率，或降低 `MAX_CONCURRENCY` 避免内存抖动。
+* 如果 `/metrics` 中 `onvif_exporter_cv_queue_size` 长期接近 `CV_QUEUE_MAXSIZE`，说明视频分析跟不上抓取速度。低内存机器优先增大 `REFRESH_THRESHOLD`、增大 `CACHE_TTL` 或降低 Prometheus `scrape_interval` 频率；只有内存和 CPU 还有余量时，才增加 `CV_MAX_CONCURRENCY`。
 * 如果摄像头数量很多，建议让 `CACHE_TTL` 大于 `REFRESH_THRESHOLD` 至少 60 秒，减少缓存过期窗口。
 
 ---
@@ -278,9 +307,10 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `probe_success` | Gauge | `/probe` | 无 | 探测是否整体成功。`1` 表示 ONVIF 网络通信和鉴权成功，`0` 表示失败。 |
 | `onvif_device_info` | Gauge | `/probe` | `manufacturer`, `model`, `firmware`, `mac`, `encoding` | 设备静态信息，值固定为 `1`，具体信息通过 labels 表示。 |
 | `onvif_system_time_drift_seconds` | Gauge | `/probe` | 无 | 摄像头 UTC 系统时间与 Exporter 服务器时间的漂移秒数。正数表示摄像头时间落后于服务器。 |
-| `onvif_video_resolution_width` | Gauge | `/probe` | 无 | ONVIF 返回的视频编码分辨率宽度。 |
-| `onvif_video_resolution_height` | Gauge | `/probe` | 无 | ONVIF 返回的视频编码分辨率高度。 |
-| `onvif_video_framerate_limit` | Gauge | `/probe` | 无 | ONVIF 返回的视频编码帧率上限。 |
+| `onvif_video_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 实际用于 RTSP/CV 分析的 ONVIF 媒体 Profile。程序默认选择分辨率最小的 Profile。 |
+| `onvif_video_resolution_width` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率宽度。 |
+| `onvif_video_resolution_height` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率高度。 |
+| `onvif_video_framerate_limit` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码帧率上限。 |
 | `onvif_imaging_autofocus_enabled` | Gauge | `/probe` | 无 | 自动对焦状态。`1` 表示 `AUTO`，`0` 表示 `MANUAL`，`-1` 表示未获取到或设备不支持。 |
 | `onvif_ptz_supported` | Gauge | `/probe` | 无 | 是否成功获取 PTZ 坐标。`1` 表示支持或成功返回，`0` 表示不支持或获取失败。 |
 | `onvif_ptz_pan` | Gauge | `/probe` | 无 | 云台 Pan 当前坐标。仅在成功获取 PTZ 数据时设置。 |
@@ -297,6 +327,9 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `onvif_video_cv_saturation` | Gauge | `/probe` | 无 | HSV 饱和度通道平均值，用于观察画面色彩饱和程度。 |
 | `onvif_video_cv_red_blue_ratio` | Gauge | `/probe` | 无 | 红蓝通道均值比值。明显偏离 `1.0` 时可用于发现偏色、IR-Cut 滤光片异常等问题。 |
 | `onvif_video_cv_sharpness` | Gauge | `/probe` | 无 | 拉普拉斯方差锐度值。数值大幅下降通常提示跑焦、起雾、脏污或遮挡。 |
+| `onvif_exporter_cv_max_concurrency` | Gauge | `/metrics` | 无 | 当前 CV 视频分析最大并发数。 |
+| `onvif_exporter_onvif_max_concurrency` | Gauge | `/metrics` | 无 | 当前 ONVIF 网络请求线程最大并发数。 |
+| `onvif_exporter_cv_queue_capacity` | Gauge | `/metrics` | 无 | 当前 CV 后台刷新队列容量。 |
 | `onvif_exporter_cv_cache_entries` | Gauge | `/metrics` | 无 | Exporter 当前 CV 缓存 target 数量。 |
 | `onvif_exporter_cv_queue_size` | Gauge | `/metrics` | 无 | Exporter 当前 CV 后台刷新队列长度。长期接近 `CV_QUEUE_MAXSIZE` 表示后台分析处理不过来。 |
 | `onvif_exporter_cv_probing_targets` | Gauge | `/metrics` | 无 | Exporter 当前正在排队或分析的 CV target 数量。 |
@@ -447,13 +480,13 @@ groups:
           description: "{{ $labels.instance }} Zoom 当前值与期望值偏差超过 0.001。"
 
       - alert: OnvifExporterCvQueueBacklog
-        expr: onvif_exporter_cv_queue_size >= 0.8 * 8
+        expr: onvif_exporter_cv_queue_size >= 0.8 * onvif_exporter_cv_queue_capacity
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "ONVIF Exporter CV 队列积压"
-          description: "CV 后台队列持续高于 80%。如果你修改了 CV_QUEUE_MAXSIZE，请同步调整该规则里的 8。"
+          description: "CV 后台队列持续高于 80%。低内存机器优先降低抓取频率或拉长 CV 刷新间隔。"
 
       - alert: OnvifExporterCvCacheTooLarge
         expr: onvif_exporter_cv_cache_entries >= 0.9 * 256

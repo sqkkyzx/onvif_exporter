@@ -11,11 +11,13 @@ import gc
 import random
 import secrets
 import subprocess
+import sys
 import urllib.parse
 import datetime
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Query, Response, Depends, HTTPException, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -28,19 +30,28 @@ from onvif import ONVIFCamera
 # 1. 动态加载项目元数据 (从 pyproject.toml)
 # ==========================================
 def get_project_metadata():
-    try:
-        with open("pyproject.toml", "rb") as f:
-            data = tomllib.load(f)
+    metadata_paths = [Path("pyproject.toml")]
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        metadata_paths.append(Path(bundle_dir) / "pyproject.toml")
+
+    for metadata_path in metadata_paths:
+        if not metadata_path.exists():
+            continue
+
+        try:
+            with metadata_path.open("rb") as f:
+                data = tomllib.load(f)
             project = data.get("project", {})
             return (
                 project.get("name", "onvif-exporter"),
                 project.get("version", "unknown"),
                 project.get("description", "ONVIF/CV Exporter for Prometheus")
             )
-    except Exception as e:
-        logging.getLogger("uvicorn.error").debug(f"Failed to load project metadata: {e}")
-        # 兼容找不到文件的情况
-        return "onvif-exporter", "dev", "ONVIF Exporter (Metadata Missing)"
+        except Exception as e:
+            logging.getLogger("uvicorn.error").debug(f"Failed to load project metadata from {metadata_path}: {e}")
+
+    return "onvif-exporter", "dev", "ONVIF Exporter (Metadata Missing)"
 
 APP_NAME, APP_VERSION, APP_DESC = get_project_metadata()
 
@@ -48,8 +59,11 @@ APP_NAME, APP_VERSION, APP_DESC = get_project_metadata()
 # 2. 核心配置与环境变量
 # ==========================================
 
-# 同时执行拉取和分析视频流（OpenCV/FFmpeg）的最大任务数
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
+# 同时执行拉取和分析视频流（OpenCV/FFmpeg）的最大任务数。
+# MAX_CONCURRENCY 是旧配置名，继续作为 CV_MAX_CONCURRENCY 的兼容别名。
+CV_MAX_CONCURRENCY = int(os.getenv("CV_MAX_CONCURRENCY", os.getenv("MAX_CONCURRENCY", "1")))
+# ONVIF 协议交互是轻量网络请求，独立控制线程数，避免和重内存 CV 并发绑死。
+ONVIF_MAX_CONCURRENCY = int(os.getenv("ONVIF_MAX_CONCURRENCY", "4"))
 # 分析视频流（OpenCV/FFmpeg）缓存数据能存活的“最大寿命”（单位：秒）。
 CACHE_TTL = int(os.getenv("CACHE_TTL", "180"))
 # 触发后台更新任务的“时间临界点”（单位：秒）。
@@ -61,7 +75,7 @@ STRICT_ZERO_PTZ_CHECK = os.getenv("STRICT_ZERO_PTZ_CHECK", "False").lower() in (
 # CV 子进程执行多少个任务后重建。OpenCV/FFmpeg 在长生命周期进程里常见 native 内存缓慢增长。
 CV_PROCESS_MAX_TASKS = int(os.getenv("CV_PROCESS_MAX_TASKS", "25"))
 # CV 后台队列上限。Prometheus 高频 scrape 或大量 target 异常时，避免无限排队。
-CV_QUEUE_MAXSIZE = int(os.getenv("CV_QUEUE_MAXSIZE", str(MAX_CONCURRENCY * 4)))
+CV_QUEUE_MAXSIZE = int(os.getenv("CV_QUEUE_MAXSIZE", str(CV_MAX_CONCURRENCY * 2)))
 # CV 缓存最大目标数。防止 target 参数变化或动态发现导致字典无限增长。
 CV_CACHE_MAX_ENTRIES = int(os.getenv("CV_CACHE_MAX_ENTRIES", "256"))
 # 缓存清理间隔。清理超过 CACHE_TTL 的旧 target 数据。
@@ -142,11 +156,11 @@ async def lifespan(app: FastAPI):
 
     cv_queue = asyncio.Queue(maxsize=CV_QUEUE_MAXSIZE)
     process_pool = ProcessPoolExecutor(
-        max_workers=MAX_CONCURRENCY,
+        max_workers=CV_MAX_CONCURRENCY,
         max_tasks_per_child=CV_PROCESS_MAX_TASKS
     )
-    thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENCY * 3)
-    workers = [asyncio.create_task(cv_worker()) for _ in range(MAX_CONCURRENCY)]
+    thread_pool = ThreadPoolExecutor(max_workers=ONVIF_MAX_CONCURRENCY)
+    workers = [asyncio.create_task(cv_worker()) for _ in range(CV_MAX_CONCURRENCY)]
 
     # 打印标准化 Banner
     auth_status = "🔐 已开启" if (AUTH_USERNAME and AUTH_PASSWORD) else "🔓 已禁用 (设置 ENV 开启)"
@@ -155,9 +169,9 @@ async def lifespan(app: FastAPI):
     🚀 {APP_NAME} v{APP_VERSION} 初始化完成
     ========================================================
     * 描述: {APP_DESC}
-    * 进程池并发数: {MAX_CONCURRENCY} (Process Pool)
+    * CV 分析进程并发数: {CV_MAX_CONCURRENCY} (Process Pool)
     * CV 子进程任务上限: {CV_PROCESS_MAX_TASKS} tasks/child
-    * 线程池并发数: {MAX_CONCURRENCY * 3} (Thread Pool)
+    * ONVIF 线程并发数: {ONVIF_MAX_CONCURRENCY} (Thread Pool)
     * 缓存机制: {CACHE_TTL}s 过期 / {REFRESH_THRESHOLD}s 静默刷新 / 最多 {CV_CACHE_MAX_ENTRIES} targets
     * CV 队列上限: {CV_QUEUE_MAXSIZE}
     * HTTP 访问日志: {"已开启" if ACCESS_LOG_ENABLED else "已关闭"}
@@ -295,6 +309,8 @@ def sync_detect_stream(stream_uri: str):
                 mean_b = mean_bgr[0]
                 result["rb_ratio"] = mean_bgr[2] / (mean_b + 1e-5)
 
+                del frame, gray, hsv
+
         cap.release()
 
         if result["stream_exists"]:
@@ -338,6 +354,56 @@ def cleanup_cv_cache(now: float):
         oldest_keys = sorted(cv_cache, key=lambda key: cv_cache[key].get("time", 0))[:overflow]
         for key in oldest_keys:
             cv_cache.pop(key, None)
+
+
+def get_profile_resolution(profile) -> tuple[int, int] | None:
+    video_conf = getattr(profile, "VideoEncoderConfiguration", None)
+    if video_conf is None:
+        return None
+
+    resolution = getattr(video_conf, "Resolution", None)
+    if resolution is None:
+        return None
+
+    width = getattr(resolution, "Width", None)
+    height = getattr(resolution, "Height", None)
+    if width is None or height is None:
+        return None
+
+    try:
+        width = int(width)
+        height = int(height)
+    except (TypeError, ValueError):
+        return None
+
+    if width <= 0 or height <= 0:
+        return None
+
+    return width, height
+
+
+def select_lowest_resolution_profile(profiles):
+    profiles_with_resolution = [
+        (resolution[0] * resolution[1], index, profile)
+        for index, profile in enumerate(profiles)
+        if (resolution := get_profile_resolution(profile)) is not None
+    ]
+    if profiles_with_resolution:
+        return min(profiles_with_resolution, key=lambda item: (item[0], item[1]))[2]
+
+    for profile in profiles:
+        if getattr(profile, "VideoEncoderConfiguration", None) is not None:
+            return profile
+
+    return profiles[0]
+
+
+def select_ptz_profile(profiles):
+    for profile in profiles:
+        if getattr(profile, "PTZConfiguration", None) is not None:
+            return profile
+
+    return profiles[0]
 
 
 def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
@@ -385,9 +451,13 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
         if not profiles:
             raise Exception("未找到媒体配置文件 (Media Profiles)")
 
-        token = profiles[0].token
+        stream_profile = select_lowest_resolution_profile(profiles)
+        ptz_profile = select_ptz_profile(profiles)
+
+        stream_token = stream_profile.token
+        ptz_token = ptz_profile.token
         req = media_service.create_type('GetStreamUri')
-        req.ProfileToken = token
+        req.ProfileToken = stream_token
         req.StreamSetup = {'Stream': 'RTP-Unicast', 'Transport': {'Protocol': 'RTSP'}}
 
         stream_uri = media_service.GetStreamUri(req).Uri
@@ -397,17 +467,21 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
             fixed_rtsp_netloc = f"{target}:{rtsp_port}"
             stream_uri = parsed_rtsp._replace(netloc=fixed_rtsp_netloc).geturl()
 
-        video_conf = profiles[0].VideoEncoderConfiguration
+        video_conf = stream_profile.VideoEncoderConfiguration
+        rate_control = getattr(video_conf, "RateControl", None)
+        stream_width, stream_height = get_profile_resolution(stream_profile) or (0, 0)
         video_metrics = {
-            "width": video_conf.Resolution.Width,
-            "height": video_conf.Resolution.Height,
-            "fps": video_conf.RateControl.FrameRateLimit if hasattr(video_conf, 'RateControl') else 0,
-            "encoding": video_conf.Encoding
+            "width": stream_width,
+            "height": stream_height,
+            "fps": getattr(rate_control, "FrameRateLimit", 0) if rate_control is not None else 0,
+            "encoding": getattr(video_conf, "Encoding", "unknown"),
+            "profile_token": str(stream_token),
+            "profile_name": str(getattr(stream_profile, "Name", "") or "")
         }
 
         focus_mode_val = -1.0
         try:
-            video_source_token = profiles[0].VideoSourceConfiguration.SourceToken
+            video_source_token = stream_profile.VideoSourceConfiguration.SourceToken
             imaging_service = cam.create_imaging_service()
             imaging_settings = imaging_service.GetImagingSettings({'VideoSourceToken': video_source_token})
             if hasattr(imaging_settings, 'Focus') and imaging_settings.Focus:
@@ -423,7 +497,7 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
         ptz_data = None
         try:
             ptz_service = cam.create_ptz_service()
-            ptz_status = ptz_service.GetStatus({'ProfileToken': token})
+            ptz_status = ptz_service.GetStatus({'ProfileToken': ptz_token})
 
             pan_val = ptz_status.Position.PanTilt.x
             tilt_val = ptz_status.Position.PanTilt.y
@@ -464,7 +538,7 @@ def sync_onvif_control(target: str, user: str, password: str, port: int,
         if not profiles:
             raise Exception("未找到媒体配置文件，无法获取 ProfileToken")
 
-        token = profiles[0].token
+        token = select_ptz_profile(profiles).token
         ptz_service = cam.create_ptz_service()
 
         if mode == "ptz":
@@ -539,6 +613,8 @@ async def probe(
     metric_success = Gauge('probe_success', '设备是否在线可通信', registry=registry)
     metric_device_info = Gauge('onvif_device_info', 'ONVIF设备信息',
                                ['manufacturer', 'model', 'firmware', 'mac', 'encoding'], registry=registry)
+    metric_stream_profile_info = Gauge('onvif_video_stream_profile_info', '实际用于RTSP/CV分析的ONVIF媒体Profile',
+                                       ['token', 'name'], registry=registry)
     metric_time_drift = Gauge('onvif_system_time_drift_seconds', '系统时间漂移(秒)', registry=registry)
     metric_video_width = Gauge('onvif_video_resolution_width', '分辨率宽', registry=registry)
     metric_video_height = Gauge('onvif_video_resolution_height', '分辨率高', registry=registry)
@@ -592,6 +668,8 @@ async def probe(
         metric_device_info.labels(manufacturer=dev_info.Manufacturer, model=dev_info.Model,
                                   firmware=dev_info.FirmwareVersion, mac=mac_address,
                                   encoding=video_metrics['encoding']).set(1.0)
+        metric_stream_profile_info.labels(token=video_metrics['profile_token'],
+                                          name=video_metrics['profile_name']).set(1.0)
         metric_time_drift.set(time_drift)
         metric_video_width.set(video_metrics['width'])
         metric_video_height.set(video_metrics['height'])
@@ -706,6 +784,9 @@ async def metrics():
     queue_size = cv_queue.qsize() if cv_queue else 0
     body = (
         f"# {APP_NAME} v{APP_VERSION} Core is running.\n"
+        f"onvif_exporter_cv_max_concurrency {CV_MAX_CONCURRENCY}\n"
+        f"onvif_exporter_onvif_max_concurrency {ONVIF_MAX_CONCURRENCY}\n"
+        f"onvif_exporter_cv_queue_capacity {CV_QUEUE_MAXSIZE}\n"
         f"onvif_exporter_cv_cache_entries {len(cv_cache)}\n"
         f"onvif_exporter_cv_queue_size {queue_size}\n"
         f"onvif_exporter_cv_probing_targets {len(cv_probing_targets)}\n"
@@ -713,8 +794,14 @@ async def metrics():
     return Response(body, media_type="text/plain")
 
 
-if __name__ == "__main__":
+def main():
     import uvicorn
+
+    if "--version" in sys.argv:
+        print(f"{APP_NAME} {APP_VERSION}")
+        return
+
+    multiprocessing.freeze_support()
 
     log_config = uvicorn.config.LOGGING_CONFIG
     log_config["formatters"]["access"]["fmt"] = "%(asctime)s - %(levelname)s - [%(client_addr)s] - \"%(request_line)s\" %(status_code)s"
@@ -724,7 +811,7 @@ if __name__ == "__main__":
     log_config["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=9121,
         log_config=log_config,
@@ -732,3 +819,7 @@ if __name__ == "__main__":
         access_log=ACCESS_LOG_ENABLED,
         server_header=False
     )
+
+
+if __name__ == "__main__":
+    main()

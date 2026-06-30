@@ -69,6 +69,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: 🧱 构建 Linux x86_64 二进制
+        run: |
+          docker run --rm \
+            -e VERSION="${VERSION}" \
+            -v "${PWD}:/src" \
+            -w /src \
+            python:3.14-slim-bookworm \
+            bash scripts/build-linux-binary.sh
+
+      - name: 📎 上传 Linux 二进制构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: onvif-exporter-linux-x86_64-v${{ env.VERSION }}
+          path: release/onvif-exporter-linux-x86_64-v${{ env.VERSION }}.tar.gz
+          if-no-files-found: error
+
       - name: 🔖 自动创建并推送 Git Tag
         run: |
           git config --local user.email "action@github.com"
@@ -80,6 +96,20 @@ jobs:
             echo "已自动创建并推送 Tag: v${{ env.VERSION }}"
           else
             echo "Tag v${{ env.VERSION }} 已存在，跳过。"
+          fi
+
+      - name: 🚀 发布 Linux 二进制到 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ASSET="release/onvif-exporter-linux-x86_64-v${VERSION}.tar.gz"
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            gh release create "$TAG" "$ASSET" \
+              --title "$TAG" \
+              --notes "Docker images are published to GHCR and Docker Hub. Linux x86_64 binary is attached for Debian LXC deployment."
           fi
 
       - name: 📢 发送钉钉构建通知
