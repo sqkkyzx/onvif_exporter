@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${VERSION:-$(grep -m 1 'version = ' pyproject.toml | cut -d '"' -f 2)}"
+if [ -z "${VERSION:-}" ]; then
+  VERSION="$(python - <<'PY'
+import tomllib
+
+with open("pyproject.toml", "rb") as f:
+    data = tomllib.load(f)
+
+print(
+    data["project"]["version"]
+)
+PY
+)"
+fi
 ARCHIVE_NAME="onvif-exporter-linux-x86_64-v${VERSION}"
 
 if command -v apt-get >/dev/null 2>&1; then
@@ -45,7 +57,7 @@ Runtime requirement on Debian LXC:
 sudo apt-get update
 sudo apt-get install -y ffmpeg
 chmod +x ./onvif-exporter
-CV_MAX_CONCURRENCY=1 ONVIF_MAX_CONCURRENCY=4 ./onvif-exporter
+CV_WORKER_COUNT=1 CV_WORKER_TASK_LIMIT=1 ONVIF_MAX_CONCURRENCY=4 ./onvif-exporter
 \`\`\`
 
 The service listens on 0.0.0.0:9121 by default.

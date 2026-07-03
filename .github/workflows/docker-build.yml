@@ -8,6 +8,7 @@ env:
   GHCR_IMAGE: ghcr.io/${{ github.repository }}
   DOCKERHUB_IMAGE: ${{ github.repository }}
   RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -27,11 +28,32 @@ jobs:
       - name: 🏷️ 提取 pyproject.toml 版本号
         id: get_version
         run: |
-          # 提取 version = "" 中的数字
-          VERSION=$(grep -m 1 'version = ' pyproject.toml | cut -d '"' -f 2)
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          python - <<'PY' > version.env
+          import re
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          version = data["project"]["version"]
+          is_prerelease = "true" if re.search(
+              r"(a|b|rc|dev)\d*(\+.*)?$",
+              version,
+              re.IGNORECASE,
+          ) else "false"
+
+          print(f"VERSION={version}")
+          print(f"IS_PRERELEASE={is_prerelease}")
+          PY
+
+          cat version.env >> "$GITHUB_ENV"
+          . ./version.env
+          {
+            echo "version=$VERSION"
+            echo "is_prerelease=$IS_PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
           echo "提取到版本号: $VERSION"
+          echo "是否预发布: $IS_PRERELEASE"
 
       - name: 🔑 登录 GitHub Container Registry
         uses: docker/login-action@v3
@@ -54,9 +76,8 @@ jobs:
             ${{ env.GHCR_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE }}
           tags: |
-            # 只有在 master 分支推送时，才打上 latest 标签
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
-            # 使用从 pyproject.toml 提取的版本号
+            # 只有正式版 master 分支推送时才打 latest；1.0.0b0 这类预发布不会覆盖 latest。
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' && steps.get_version.outputs.is_prerelease != 'true' }}
             type=raw,value=${{ env.VERSION }}
 
       - name: 📦 构建并推送镜像
@@ -89,7 +110,6 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          # 如果不存在该版本的 tag，则创建并推送
           if ! git rev-parse "v${{ env.VERSION }}" >/dev/null 2>&1; then
             git tag "v${{ env.VERSION }}"
             git push origin "v${{ env.VERSION }}"
@@ -104,10 +124,18 @@ jobs:
         run: |
           ASSET="release/onvif-exporter-linux-x86_64-v${VERSION}.tar.gz"
           TAG="v${VERSION}"
+          PRERELEASE_ARGS=""
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            PRERELEASE_ARGS="--prerelease"
+          fi
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$ASSET" --clobber
+            if [ "${IS_PRERELEASE}" = "true" ]; then
+              gh release edit "$TAG" --prerelease
+            fi
           else
-            gh release create "$TAG" "$ASSET" \
+            gh release create "$TAG" "$ASSET" $PRERELEASE_ARGS \
               --title "$TAG" \
               --notes "Docker images are published to GHCR and Docker Hub. Linux x86_64 binary is attached for Debian LXC deployment."
           fi
@@ -119,7 +147,7 @@ jobs:
           MIRROR_HOST: ${{ secrets.MIRROR_REGISTRY_HOST }}
         run: |
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          
+
           if [ "${{ job.status }}" == "success" ]; then
             MSG="#### ${{ github.repository }} \n\n > 构建状态：[成功 ✅](${{ env.RUN_URL }}) \n\n > 版本: v${{ env.VERSION }} \n\n > GHCR: ${{ env.GHCR_IMAGE }} \n\n > DockerHub: ${{ env.DOCKERHUB_IMAGE }}\n\n > 镜像地址: ${{ env.MIRROR_HOST }}/${{ env.DOCKERHUB_IMAGE }}"
             TITLE="✅ 构建成功！"
@@ -127,9 +155,8 @@ jobs:
             MSG="#### ${{ github.repository }} \n\n > 构建状态：[失败 ❌](${{ env.RUN_URL }}) \n\n > 版本: v${{ env.VERSION }} "
             TITLE="❌ 构建失败！"
           fi
-          
+
           if [ -n "$WEBHOOK_URL" ]; then
-             # 修正为钉钉的标准 JSON 结构
              curl -X POST "$WEBHOOK_URL" \
                   -H "Content-Type: application/json" \
                   -d "{
@@ -140,4 +167,3 @@ jobs:
                     }
                   }"
           fi
-

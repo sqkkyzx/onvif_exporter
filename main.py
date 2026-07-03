@@ -59,13 +59,16 @@ APP_NAME, APP_VERSION, APP_DESC = get_project_metadata()
 # 2. 核心配置与环境变量
 # ==========================================
 
-# 同时执行拉取和分析视频流（OpenCV/FFmpeg）的最大任务数。
-# MAX_CONCURRENCY 是旧配置名，继续作为 CV_MAX_CONCURRENCY 的兼容别名。
-CV_MAX_CONCURRENCY = int(os.getenv("CV_MAX_CONCURRENCY", os.getenv("MAX_CONCURRENCY", "1")))
+# CV 多 worker 调度：总 CV 任务槽位 = CV_WORKER_COUNT * CV_WORKER_TASK_LIMIT。
+CV_WORKER_COUNT = max(1, int(os.getenv("CV_WORKER_COUNT", "1")))
+CV_WORKER_TASK_LIMIT = max(1, int(os.getenv("CV_WORKER_TASK_LIMIT", "1")))
+CV_WORKER_SLOT_COUNT = CV_WORKER_COUNT * CV_WORKER_TASK_LIMIT
 # ONVIF 协议交互是轻量网络请求，独立控制线程数，避免和重内存 CV 并发绑死。
 ONVIF_MAX_CONCURRENCY = int(os.getenv("ONVIF_MAX_CONCURRENCY", "4"))
-# 分析视频流（OpenCV/FFmpeg）缓存数据能存活的“最大寿命”（单位：秒）。
-CACHE_TTL = int(os.getenv("CACHE_TTL", "180"))
+# 视频流可读状态缓存寿命。它只表示最近是否成功读到视频帧，不等待完整分析结果。
+STREAM_CACHE_TTL = int(os.getenv("STREAM_CACHE_TTL", "180"))
+# 分析结果缓存寿命。黑屏、亮度、清晰度、音量等慢结果独立于视频流可读状态。
+ANALYSIS_CACHE_TTL = int(os.getenv("ANALYSIS_CACHE_TTL", "180"))
 # 触发后台更新任务的“时间临界点”（单位：秒）。
 REFRESH_THRESHOLD = int(os.getenv("REFRESH_THRESHOLD", "120"))
 # 判定画面为“黑屏”的像素平均亮度界限（范围 0 - 255）。
@@ -75,10 +78,10 @@ STRICT_ZERO_PTZ_CHECK = os.getenv("STRICT_ZERO_PTZ_CHECK", "False").lower() in (
 # CV 子进程执行多少个任务后重建。OpenCV/FFmpeg 在长生命周期进程里常见 native 内存缓慢增长。
 CV_PROCESS_MAX_TASKS = int(os.getenv("CV_PROCESS_MAX_TASKS", "25"))
 # CV 后台队列上限。Prometheus 高频 scrape 或大量 target 异常时，避免无限排队。
-CV_QUEUE_MAXSIZE = int(os.getenv("CV_QUEUE_MAXSIZE", str(CV_MAX_CONCURRENCY * 2)))
+CV_QUEUE_MAXSIZE = int(os.getenv("CV_QUEUE_MAXSIZE", str(CV_WORKER_SLOT_COUNT * 2)))
 # CV 缓存最大目标数。防止 target 参数变化或动态发现导致字典无限增长。
 CV_CACHE_MAX_ENTRIES = int(os.getenv("CV_CACHE_MAX_ENTRIES", "256"))
-# 缓存清理间隔。清理超过 CACHE_TTL 的旧 target 数据。
+# 缓存清理间隔。清理超过各自 TTL 的旧 target 数据。
 CV_CACHE_CLEAN_INTERVAL = int(os.getenv("CV_CACHE_CLEAN_INTERVAL", "120"))
 # 是否输出正常 HTTP 请求访问日志。默认关闭，避免 Prometheus 高频抓取刷屏。
 ACCESS_LOG_ENABLED = os.getenv("EXPORTER_ACCESS_LOG", "False").lower() in ("true", "1", "yes")
@@ -141,7 +144,8 @@ def verify_auth(credentials: HTTPBasicCredentials | None = Depends(security)):
 # ==========================================
 # 全局状态池定义
 # ==========================================
-cv_cache = {}
+cv_stream_cache = {}
+cv_analysis_cache = {}
 cv_queue = None
 cv_probing_targets = set()
 process_pool = None
@@ -149,6 +153,45 @@ thread_pool = None
 last_cv_cache_clean = 0.0
 
 logger = logging.getLogger("uvicorn.error")
+
+# Beta 诊断日志：正式版发布前直接改为 False 或删除相关调用。
+BETA_DIAGNOSTICS_ENABLED = True
+BETA_DIAGNOSTIC_PURPLE = "\033[95m"
+BETA_DIAGNOSTIC_RESET = "\033[0m"
+
+
+def beta_diag_log(message: str) -> None:
+    """输出 beta 诊断日志；整行用紫色，便于从普通日志里快速筛出。"""
+    if BETA_DIAGNOSTICS_ENABLED:
+        logger.info("%s[BETA-DIAG] %s%s", BETA_DIAGNOSTIC_PURPLE, message, BETA_DIAGNOSTIC_RESET)
+
+
+def format_diag_seconds(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}s"
+
+
+def format_diag_keys(keys: list[str]) -> str:
+    if not keys:
+        return "-"
+
+    preview = ", ".join(keys[:5])
+    if len(keys) > 5:
+        return f"{preview}, +{len(keys) - 5} more"
+    return preview
+
+
+def format_rtsp_endpoint(stream_uri: str) -> str:
+    parsed = urllib.parse.urlparse(stream_uri)
+    if not parsed.hostname:
+        return "unknown"
+
+    port = parsed.port
+    if port is None and parsed.scheme == "rtsp":
+        port = 554
+
+    return f"{parsed.hostname}:{port}" if port is not None else parsed.hostname
 
 
 # ==========================================
@@ -164,11 +207,15 @@ async def lifespan(app: FastAPI):
 
     cv_queue = asyncio.Queue(maxsize=CV_QUEUE_MAXSIZE)
     process_pool = ProcessPoolExecutor(
-        max_workers=CV_MAX_CONCURRENCY,
+        max_workers=CV_WORKER_SLOT_COUNT,
         max_tasks_per_child=CV_PROCESS_MAX_TASKS
     )
     thread_pool = ThreadPoolExecutor(max_workers=ONVIF_MAX_CONCURRENCY)
-    workers = [asyncio.create_task(cv_worker()) for _ in range(CV_MAX_CONCURRENCY)]
+    workers = [
+        asyncio.create_task(cv_worker(worker_id, slot_id))
+        for worker_id in range(CV_WORKER_COUNT)
+        for slot_id in range(CV_WORKER_TASK_LIMIT)
+    ]
 
     # 打印标准化 Banner
     auth_status = "🔐 已开启" if (AUTH_USERNAME and AUTH_PASSWORD) else "🔓 已禁用 (设置 ENV 开启)"
@@ -177,18 +224,19 @@ async def lifespan(app: FastAPI):
     🚀 {APP_NAME} v{APP_VERSION} 初始化完成
     ========================================================
     * 描述: {APP_DESC}
-    * CV 分析进程并发数: {CV_MAX_CONCURRENCY} (Process Pool)
+    * CV 调度 worker: {CV_WORKER_COUNT} workers x {CV_WORKER_TASK_LIMIT} tasks/worker = {CV_WORKER_SLOT_COUNT} process slots
     * CV 子进程任务上限: {CV_PROCESS_MAX_TASKS} tasks/child
     * CV 单次读帧尝试: {CV_READ_ATTEMPTS} 次 / 间隔 {CV_READ_RETRY_DELAY_SECONDS}s / buffer={CAP_PROP_BUFFERSIZE}
     * ONVIF 选流策略: {"优先 H.264" if PREFER_H264_STREAM else "仅按最低分辨率"}
     * ONVIF 线程并发数: {ONVIF_MAX_CONCURRENCY} (Thread Pool)
-    * 缓存机制: {CACHE_TTL}s 过期 / {REFRESH_THRESHOLD}s 静默刷新 / 最多 {CV_CACHE_MAX_ENTRIES} targets
+    * 缓存机制: stream={STREAM_CACHE_TTL}s / analysis={ANALYSIS_CACHE_TTL}s / {REFRESH_THRESHOLD}s 静默刷新 / 最多 {CV_CACHE_MAX_ENTRIES} targets
     * CV 队列上限: {CV_QUEUE_MAXSIZE}
     * HTTP 访问日志: {"已开启" if ACCESS_LOG_ENABLED else "已关闭"}
     * HTTP 鉴权: {auth_status}
     ========================================================
     """
     logger.info(banner)
+    beta_diag_log(f"diagnostics_enabled=true version={APP_VERSION} mode=hardcoded_beta")
 
     yield
 
@@ -274,14 +322,8 @@ def detect_audio_volume_db(stream_uri: str) -> float | None:
     return None
 
 
-def sync_detect_stream(stream_uri: str):
-    """
-    阻塞型：视频流质量检测 (重度 I/O 与 CPU)。
-    运行在可定期重建的独立子进程中，降低 OpenCV/FFmpeg native 内存累积风险。
-    修改为返回 dict，方便灵活调用。
-    """
-    result = {
-        "stream_exists": False,
+def build_default_analysis_data():
+    return {
         "is_black": False,
         "audio_volume_db": AUDIO_UNKNOWN_VOLUME_DB,
         "brightness": 0.0,
@@ -289,6 +331,17 @@ def sync_detect_stream(stream_uri: str):
         "saturation": 0.0,
         "rb_ratio": 1.0,
         "sharpness": 0.0
+    }
+
+
+def sync_detect_stream_frame(stream_uri: str):
+    """
+    阻塞型：读取视频首帧并完成轻量图像分析。
+    不在这里做音频检测，避免慢分析拖住 stream_exists 的缓存更新。
+    """
+    result = {
+        "stream_exists": False,
+        "analysis": build_default_analysis_data()
     }
 
     try:
@@ -312,49 +365,50 @@ def sync_detect_stream(stream_uri: str):
 
             if frame is not None:
                 result["stream_exists"] = True
+                analysis = result["analysis"]
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                result["sharpness"] = cv2.Laplacian(gray, cv2.CV_64F).var()
+                analysis["sharpness"] = cv2.Laplacian(gray, cv2.CV_64F).var()
 
                 brightness = cv2.mean(gray)[0]
-                result["brightness"] = brightness
+                analysis["brightness"] = brightness
                 if brightness < BLACK_THRESHOLD:
-                    result["is_black"] = True
+                    analysis["is_black"] = True
 
                 _, std_dev = cv2.meanStdDev(gray)
-                result["contrast"] = std_dev[0][0]
+                analysis["contrast"] = std_dev[0][0]
 
                 hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                result["saturation"] = cv2.mean(hsv[:, :, 1])[0]
+                analysis["saturation"] = cv2.mean(hsv[:, :, 1])[0]
 
                 mean_bgr = cv2.mean(frame)
                 mean_b = mean_bgr[0]
-                result["rb_ratio"] = mean_bgr[2] / (mean_b + 1e-5)
+                analysis["rb_ratio"] = mean_bgr[2] / (mean_b + 1e-5)
 
                 del frame, gray, hsv
 
         cap.release()
 
-        if result["stream_exists"]:
-            try:
-                audio_volume_db = detect_audio_volume_db(stream_uri)
-                if audio_volume_db is not None:
-                    result["audio_volume_db"] = audio_volume_db
-            except ffmpeg.Error as e:
-                logger.error("FFmpeg 音频检测失败: %s", format_ffmpeg_error(e))
-            except subprocess.TimeoutExpired:
-                logger.error("FFmpeg 音频检测超时: timeout=%ss", FFMPEG_AUDIO_TIMEOUT_SECONDS)
-            except Exception as e:
-                logger.error("FFmpeg 音频检测异常: %s", e)
-                pass
-
     except Exception as e:
-        print(f"流检测进程异常: {e}")
+        print(f"视频帧检测进程异常: {e}")
     finally:
         if 'cap' in locals(): cap.release()
         if 'frame' in locals(): del frame
 
     return result
+
+
+def sync_detect_audio_volume(stream_uri: str):
+    """阻塞型：音频音量分析。独立运行，不能拖住视频流状态缓存。"""
+    try:
+        return detect_audio_volume_db(stream_uri)
+    except ffmpeg.Error as e:
+        logger.error("FFmpeg 音频检测失败: %s", format_ffmpeg_error(e))
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg 音频检测超时: timeout=%ss", FFMPEG_AUDIO_TIMEOUT_SECONDS)
+    except Exception as e:
+        logger.error("FFmpeg 音频检测异常: %s", e)
+    return None
 
 
 def cleanup_cv_cache(now: float):
@@ -364,18 +418,33 @@ def cleanup_cv_cache(now: float):
         return
 
     last_cv_cache_clean = now
-    expired_keys = [
-        key for key, entry in cv_cache.items()
-        if now - entry.get("time", 0) > CACHE_TTL
-    ]
-    for key in expired_keys:
-        cv_cache.pop(key, None)
 
-    overflow = len(cv_cache) - CV_CACHE_MAX_ENTRIES
-    if overflow > 0:
-        oldest_keys = sorted(cv_cache, key=lambda key: cv_cache[key].get("time", 0))[:overflow]
-        for key in oldest_keys:
-            cv_cache.pop(key, None)
+    cache_specs = (
+        ("stream", cv_stream_cache, STREAM_CACHE_TTL),
+        ("analysis", cv_analysis_cache, ANALYSIS_CACHE_TTL),
+    )
+    for cache_name, cache, ttl in cache_specs:
+        expired_keys = [
+            key for key, entry in cache.items()
+            if now - entry.get("time", 0) > ttl
+        ]
+        for key in expired_keys:
+            cache.pop(key, None)
+        if expired_keys:
+            beta_diag_log(
+                f"cache_cleanup cache={cache_name} reason=expired ttl={ttl}s "
+                f"removed={len(expired_keys)} keys={format_diag_keys(expired_keys)} remaining={len(cache)}"
+            )
+
+        overflow = len(cache) - CV_CACHE_MAX_ENTRIES
+        if overflow > 0:
+            oldest_keys = sorted(cache, key=lambda key: cache[key].get("time", 0))[:overflow]
+            for key in oldest_keys:
+                cache.pop(key, None)
+            beta_diag_log(
+                f"cache_cleanup cache={cache_name} reason=max_entries max_entries={CV_CACHE_MAX_ENTRIES} "
+                f"removed={len(oldest_keys)} keys={format_diag_keys(oldest_keys)} remaining={len(cache)}"
+            )
 
 
 def get_profile_resolution(profile) -> tuple[int, int] | None:
@@ -425,6 +494,18 @@ def get_profile_codec_priority(profile) -> int:
     if not encoding:
         return 2
     return 3
+
+
+def describe_profile_for_diag(index: int, profile) -> str:
+    resolution = get_profile_resolution(profile)
+    width, height = resolution or (0, 0)
+    encoding = get_profile_encoding(profile) or "UNKNOWN"
+    return (
+        f"{index}:token={getattr(profile, 'token', '')},"
+        f"name={str(getattr(profile, 'Name', '') or '')},"
+        f"encoding={encoding},resolution={width}x{height},"
+        f"codec_priority={get_profile_codec_priority(profile)}"
+    )
 
 
 def select_lowest_resolution_profile(profiles):
@@ -525,6 +606,13 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
             "profile_token": str(stream_token),
             "profile_name": str(getattr(stream_profile, "Name", "") or "")
         }
+        beta_diag_log(
+            f"onvif_profiles target={target} port={port} "
+            f"selected_token={video_metrics['profile_token']} selected_name={video_metrics['profile_name']} "
+            f"selected_encoding={video_metrics['encoding']} selected_resolution={stream_width}x{stream_height} "
+            f"rtsp_endpoint={format_rtsp_endpoint(stream_uri)} "
+            f"profiles=[{'; '.join(describe_profile_for_diag(index, profile) for index, profile in enumerate(profiles))}]"
+        )
 
         focus_mode_val = -1.0
         try:
@@ -619,25 +707,70 @@ def sync_onvif_control(target: str, user: str, password: str, port: int,
         logger.error(f"[{target}] PTZ 控制失败: {e}")
         raise Exception(f"控制指令执行失败: {str(e)}")
 
-async def cv_worker():
+async def cv_worker(worker_id: int, slot_id: int):
     """后台工作协程：专门负责消耗资源的 CV 拉流解析"""
     loop = asyncio.get_running_loop()
     while True:
         cache_key, auth_uri = await cv_queue.get()
+        task_started = time.perf_counter()
+        stagger_sleep = 0.0
+        frame_elapsed = None
+        audio_elapsed = None
+        audio_status = "skipped"
+        stream_exists = False
         try:
             # 错峰缓冲，避免高并发爆破内存
-            await asyncio.sleep(random.uniform(0.5, 2.0))
-            cv_data = await loop.run_in_executor(process_pool, sync_detect_stream, auth_uri)
+            stagger_sleep = random.uniform(0.5, 2.0)
+            await asyncio.sleep(stagger_sleep)
+            frame_started = time.perf_counter()
+            frame_data = await loop.run_in_executor(process_pool, sync_detect_stream_frame, auth_uri)
+            frame_elapsed = time.perf_counter() - frame_started
+            now = time.time()
+            stream_exists = frame_data["stream_exists"]
 
-            # 更新 CV 专属缓存
-            cv_cache[cache_key] = {
-                "time": time.time(),
-                "data": cv_data
+            # STEP 1: 首帧读到后立即更新视频流状态，避免慢分析拖累 stream_exists。
+            cv_stream_cache[cache_key] = {
+                "time": now,
+                "data": {
+                    "stream_exists": stream_exists
+                }
             }
+
+            if stream_exists:
+                analysis_data = frame_data["analysis"]
+                cv_analysis_cache[cache_key] = {
+                    "time": now,
+                    "data": analysis_data
+                }
+
+                # STEP 2: 音频是慢分析，单独补齐到分析缓存；失败时保留图像分析结果。
+                audio_started = time.perf_counter()
+                audio_volume_db = await loop.run_in_executor(process_pool, sync_detect_audio_volume, auth_uri)
+                audio_elapsed = time.perf_counter() - audio_started
+                if audio_volume_db is not None:
+                    audio_status = "updated"
+                    analysis_data = dict(analysis_data)
+                    analysis_data["audio_volume_db"] = audio_volume_db
+                    cv_analysis_cache[cache_key] = {
+                        "time": time.time(),
+                        "data": analysis_data
+                    }
+                else:
+                    audio_status = "failed"
+            else:
+                audio_status = "skipped_no_stream"
         except Exception as e:
-            print(f"CV Worker 异常: {e}")
+            print(f"CV Worker 异常: worker={worker_id} slot={slot_id} target={cache_key} error={e}")
         finally:
             cv_probing_targets.discard(cache_key)
+            beta_diag_log(
+                f"cv_worker target={cache_key} worker={worker_id} slot={slot_id} "
+                f"stream_exists={1 if stream_exists else 0} total={format_diag_seconds(time.perf_counter() - task_started)} "
+                f"stagger={format_diag_seconds(stagger_sleep)} frame={format_diag_seconds(frame_elapsed)} "
+                f"audio={format_diag_seconds(audio_elapsed)} audio_status={audio_status} "
+                f"queue_size={cv_queue.qsize()} probing_targets={len(cv_probing_targets)} "
+                f"stream_cache_entries={len(cv_stream_cache)} analysis_cache_entries={len(cv_analysis_cache)}"
+            )
             cv_queue.task_done()
             gc.collect()
 
@@ -695,18 +828,29 @@ async def probe(
     metric_cv_saturation = Gauge('onvif_video_cv_saturation', '图像平均饱和度', registry=registry)
     metric_cv_rb_ratio = Gauge('onvif_video_cv_red_blue_ratio', '红蓝通道比', registry=registry)
     metric_cv_sharpness = Gauge('onvif_video_cv_sharpness', '画面清晰度(对焦锐度)', registry=registry)
+    metric_stream_cache_valid = Gauge('onvif_video_stream_cache_valid', '视频流状态缓存是否有效', registry=registry)
+    metric_stream_cache_age = Gauge('onvif_video_stream_cache_age_seconds', '视频流状态缓存年龄(秒)，无缓存为 -1', registry=registry)
+    metric_analysis_cache_valid = Gauge('onvif_video_analysis_cache_valid', '视频分析结果缓存是否有效', registry=registry)
+    metric_analysis_cache_age = Gauge('onvif_video_analysis_cache_age_seconds', '视频分析结果缓存年龄(秒)，无缓存为 -1', registry=registry)
 
     metric_success.set(0)
     loop = asyncio.get_running_loop()
     cache_key = f"{target}_{port}"
+    probe_started = time.perf_counter()
+    onvif_elapsed = None
+    enqueue_state = "not_checked"
 
     try:
         # ==========================================
         # 1. 实时快轨：每次都强制刷新获取 ONVIF 状态
         # ==========================================
-        dev_info, stream_uri, ptz_data, mac_address, time_drift, video_metrics, focus_mode_val = await loop.run_in_executor(
-            thread_pool, sync_onvif_probe, target, user, password, port
-        )
+        onvif_started = time.perf_counter()
+        try:
+            dev_info, stream_uri, ptz_data, mac_address, time_drift, video_metrics, focus_mode_val = await loop.run_in_executor(
+                thread_pool, sync_onvif_probe, target, user, password, port
+            )
+        finally:
+            onvif_elapsed = time.perf_counter() - onvif_started
 
         # 只要走到这里没报错，说明网络通畅且鉴权成功
         metric_success.set(1)
@@ -736,47 +880,79 @@ async def probe(
         # ==========================================
         now = time.time()
         cleanup_cv_cache(now)
-        cache_entry = cv_cache.get(cache_key)
-        cache_age = now - cache_entry['time'] if cache_entry else float('inf')
+        stream_cache_entry = cv_stream_cache.get(cache_key)
+        analysis_cache_entry = cv_analysis_cache.get(cache_key)
+        stream_cache_age = now - stream_cache_entry['time'] if stream_cache_entry else float('inf')
+        analysis_cache_age = now - analysis_cache_entry['time'] if analysis_cache_entry else float('inf')
+        stream_cache_valid = stream_cache_entry is not None and stream_cache_age < STREAM_CACHE_TTL
+        analysis_cache_valid = analysis_cache_entry is not None and analysis_cache_age < ANALYSIS_CACHE_TTL
 
-        # 缓存达到刷新阈值且尚未排队时，后台刷新；旧缓存继续服务到 CACHE_TTL。
-        if cache_age > REFRESH_THRESHOLD and cache_key not in cv_probing_targets:
-            cv_probing_targets.add(cache_key)
-            auth_uri = build_authenticated_rtsp_uri(stream_uri, user, password)
-            try:
-                cv_queue.put_nowait((cache_key, auth_uri))
-            except asyncio.QueueFull:
-                cv_probing_targets.discard(cache_key)
-                logger.warning(
-                    "CV 队列已满，跳过本次后台刷新: target=%s queue_size=%s",
-                    cache_key,
-                    cv_queue.qsize()
-                )
+        metric_stream_cache_valid.set(1 if stream_cache_valid else 0)
+        metric_stream_cache_age.set(stream_cache_age if stream_cache_entry else -1)
+        metric_analysis_cache_valid.set(1 if analysis_cache_valid else 0)
+        metric_analysis_cache_age.set(analysis_cache_age if analysis_cache_entry else -1)
 
-        # 3. 组装 CV 数据 (不论后台是否在更新，先返回缓存的数据)
-        if cache_age < CACHE_TTL and cache_entry:
-            cv_data = cache_entry['data']
-            metric_stream_exists.set(1 if cv_data['stream_exists'] else 0)
-            metric_is_black.set(1 if cv_data['is_black'] else 0)
-            metric_audio_vol.set(cv_data['audio_volume_db'])
-            metric_cv_brightness.set(cv_data['brightness'])
-            metric_cv_contrast.set(cv_data['contrast'])
-            metric_cv_saturation.set(cv_data['saturation'])
-            metric_cv_rb_ratio.set(cv_data['rb_ratio'])
-            metric_cv_sharpness.set(cv_data['sharpness'])
+        # 流状态缓存达到刷新阈值且尚未排队时，后台刷新；分析结果由 worker 独立补齐。
+        if stream_cache_age > REFRESH_THRESHOLD:
+            if cache_key in cv_probing_targets:
+                enqueue_state = "already_probing"
+            else:
+                cv_probing_targets.add(cache_key)
+                auth_uri = build_authenticated_rtsp_uri(stream_uri, user, password)
+                try:
+                    cv_queue.put_nowait((cache_key, auth_uri))
+                    enqueue_state = "queued"
+                except asyncio.QueueFull:
+                    enqueue_state = "queue_full"
+                    cv_probing_targets.discard(cache_key)
+                    logger.warning(
+                        "CV 队列已满，跳过本次后台刷新: target=%s queue_size=%s",
+                        cache_key,
+                        cv_queue.qsize()
+                    )
         else:
-            # 缓存彻底过期或首次请求，设为默认安全值 (不打断监控，但标记为无流)
+            enqueue_state = "fresh_stream_cache"
+
+        # 3. 组装 CV 数据：流状态和分析结果分开返回。
+        stream_exists_value = 0
+        if stream_cache_valid:
+            stream_data = stream_cache_entry['data']
+            stream_exists_value = 1 if stream_data['stream_exists'] else 0
+            metric_stream_exists.set(stream_exists_value)
+        else:
             metric_stream_exists.set(0)
-            metric_is_black.set(0)
-            metric_audio_vol.set(AUDIO_UNKNOWN_VOLUME_DB)
-            metric_cv_brightness.set(0)
-            metric_cv_contrast.set(0)
-            metric_cv_saturation.set(0)
-            metric_cv_rb_ratio.set(1.0)
-            metric_cv_sharpness.set(0)
+
+        if analysis_cache_entry:
+            analysis_data = analysis_cache_entry['data']
+        else:
+            analysis_data = build_default_analysis_data()
+
+        metric_is_black.set(1 if analysis_data['is_black'] else 0)
+        metric_audio_vol.set(analysis_data['audio_volume_db'])
+        metric_cv_brightness.set(analysis_data['brightness'])
+        metric_cv_contrast.set(analysis_data['contrast'])
+        metric_cv_saturation.set(analysis_data['saturation'])
+        metric_cv_rb_ratio.set(analysis_data['rb_ratio'])
+        metric_cv_sharpness.set(analysis_data['sharpness'])
+        beta_diag_log(
+            f"probe target={target} port={port} success=1 total={format_diag_seconds(time.perf_counter() - probe_started)} "
+            f"onvif={format_diag_seconds(onvif_elapsed)} enqueue={enqueue_state} "
+            f"stream_exists={stream_exists_value} stream_cache_valid={1 if stream_cache_valid else 0} "
+            f"stream_cache_age={format_diag_seconds(stream_cache_age if stream_cache_entry else None)} "
+            f"analysis_cache_valid={1 if analysis_cache_valid else 0} "
+            f"analysis_cache_age={format_diag_seconds(analysis_cache_age if analysis_cache_entry else None)} "
+            f"queue_size={cv_queue.qsize()} probing_targets={len(cv_probing_targets)} "
+            f"rtsp_endpoint={format_rtsp_endpoint(stream_uri)} "
+            f"profile_token={video_metrics['profile_token']} profile_name={video_metrics['profile_name']} "
+            f"encoding={video_metrics['encoding']} resolution={video_metrics['width']}x{video_metrics['height']}"
+        )
 
     except Exception as e:
         print(f"[{target}] ONVIF 探测失败: {e}")
+        beta_diag_log(
+            f"probe target={target} port={port} success=0 total={format_diag_seconds(time.perf_counter() - probe_started)} "
+            f"onvif={format_diag_seconds(onvif_elapsed)} enqueue={enqueue_state} error={e}"
+        )
         # 如果 ONVIF 都挂了，直接走 fallback (仅有 probe_success=0)
         pass
 
@@ -831,14 +1007,20 @@ async def metrics():
     queue_size = cv_queue.qsize() if cv_queue else 0
     body = (
         f"# {APP_NAME} v{APP_VERSION} Core is running.\n"
-        f"onvif_exporter_cv_max_concurrency {CV_MAX_CONCURRENCY}\n"
+        f"onvif_exporter_cv_worker_count {CV_WORKER_COUNT}\n"
+        f"onvif_exporter_cv_worker_task_limit {CV_WORKER_TASK_LIMIT}\n"
+        f"onvif_exporter_cv_worker_slots {CV_WORKER_SLOT_COUNT}\n"
         f"onvif_exporter_onvif_max_concurrency {ONVIF_MAX_CONCURRENCY}\n"
         f"onvif_exporter_cv_queue_capacity {CV_QUEUE_MAXSIZE}\n"
         f"onvif_exporter_cap_prop_buffersize {CAP_PROP_BUFFERSIZE}\n"
         f"onvif_exporter_cv_read_attempts {CV_READ_ATTEMPTS}\n"
         f"onvif_exporter_cv_read_retry_delay_seconds {CV_READ_RETRY_DELAY_SECONDS}\n"
         f"onvif_exporter_prefer_h264_stream {1 if PREFER_H264_STREAM else 0}\n"
-        f"onvif_exporter_cv_cache_entries {len(cv_cache)}\n"
+        f"onvif_exporter_stream_cache_ttl_seconds {STREAM_CACHE_TTL}\n"
+        f"onvif_exporter_analysis_cache_ttl_seconds {ANALYSIS_CACHE_TTL}\n"
+        f"onvif_exporter_cv_cache_entries {len(cv_analysis_cache)}\n"
+        f"onvif_exporter_cv_stream_cache_entries {len(cv_stream_cache)}\n"
+        f"onvif_exporter_cv_analysis_cache_entries {len(cv_analysis_cache)}\n"
         f"onvif_exporter_cv_queue_size {queue_size}\n"
         f"onvif_exporter_cv_probing_targets {len(cv_probing_targets)}\n"
     )
