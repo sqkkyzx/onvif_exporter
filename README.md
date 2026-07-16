@@ -35,7 +35,7 @@
 
 我们提供了预构建的开箱即用 Docker 镜像，内置了完整的 Python 环境及 FFmpeg/OpenCV 底层依赖，推荐使用 Docker 部署。
 
-当前 `1.0.0b0` 是 beta 版本。Docker 镜像 tag、Git tag、GitHub Release tag 和二进制包名都统一使用 `1.0.0b0`；beta 版本不会覆盖 `latest`。
+当前 `1.0.0b1` 是 beta 版本。Docker 镜像 tag、Git tag、GitHub Release tag 和二进制包名都统一使用 `1.0.0b1`；beta 版本不会覆盖 `latest`。
 
 该 beta 版本硬编码开启紫色 `[BETA-DIAG]` 诊断日志，用于观察单次 `/probe` 总耗时、ONVIF 耗时、CV 队列决策、worker 分段耗时、选流结果和缓存清理行为；正式版发布前会直接从代码中关闭或移除。
 
@@ -60,10 +60,10 @@ docker run -d \
   -e CV_CACHE_CLEAN_INTERVAL=120 \
   -e BLACK_THRESHOLD=15 \
   -e STRICT_ZERO_PTZ_CHECK=true \
-  sqkkyzx/onvif_exporter:1.0.0b0
+  sqkkyzx/onvif_exporter:1.0.0b1
   
 # 备用镜像源 (GHCR):
-# ghcr.io/sqkkyzx/onvif_exporter:1.0.0b0
+# ghcr.io/sqkkyzx/onvif_exporter:1.0.0b1
 
 ```
 
@@ -74,7 +74,7 @@ docker run -d \
 ```yaml
 services:
   onvif-exporter:
-    image: sqkkyzx/onvif_exporter:1.0.0b0
+    image: sqkkyzx/onvif_exporter:1.0.0b1
     container_name: onvif-exporter
     ports:
       - "9121:9121"
@@ -98,6 +98,10 @@ services:
       - FFMPEG_AUDIO_SAMPLE_SECONDS=2 # 音频音量检测采样时长
       - FFMPEG_AUDIO_TIMEOUT_SECONDS=8 # 音频检测 FFmpeg 子进程超时
       - CAP_PROP_BUFFERSIZE=1       # OpenCV VideoCapture buffer size
+      - CV_OPEN_ATTEMPTS=3          # 单次检测最多重新建立 RTSP 连接次数
+      - CV_OPEN_RETRY_DELAY_SECONDS=0.5 # RTSP 连接重试间隔
+      - CV_OPEN_TIMEOUT_MSEC=3000   # OpenCV 打开 RTSP 超时毫秒数
+      - CV_READ_TIMEOUT_MSEC=3000   # OpenCV 读取 RTSP 超时毫秒数
       - CV_READ_ATTEMPTS=3          # 单次 CV 检测最多读帧次数
       - CV_READ_RETRY_DELAY_SECONDS=0.3 # 多次读帧之间的等待秒数
       - PREFER_H264_STREAM=true     # ONVIF 选流时优先 H.264
@@ -155,6 +159,10 @@ CV_WORKER_COUNT=1 CV_WORKER_TASK_LIMIT=1 ONVIF_MAX_CONCURRENCY=4 ./onvif-exporte
 | `FFMPEG_AUDIO_SAMPLE_SECONDS` | `2` | FFmpeg `volumedetect` 音频采样时长，单位秒。采样越长越稳定，但 CV 后台刷新耗时也会增加。 |
 | `FFMPEG_AUDIO_TIMEOUT_SECONDS` | `8` | Python 侧强制终止音频检测 FFmpeg 子进程的超时时间，单位秒。用于避免异常 RTSP 流卡住 CV 子进程。 |
 | `CAP_PROP_BUFFERSIZE` | `1` | OpenCV `VideoCapture` buffer size。部分 FFmpeg 后端可能不会完全遵守，但保留为可调项。 |
+| `CV_OPEN_ATTEMPTS` | `3` | 单次视频流检测最多重新建立 RTSP 连接的次数。每次都会释放旧 `VideoCapture` 并创建新连接。 |
+| `CV_OPEN_RETRY_DELAY_SECONDS` | `0.5` | RTSP 连接重试之间的等待时间，单位秒。正常一次成功时不会产生额外等待。 |
+| `CV_OPEN_TIMEOUT_MSEC` | `3000` | OpenCV FFmpeg 后端打开 RTSP 连接的超时时间，单位毫秒。 |
+| `CV_READ_TIMEOUT_MSEC` | `3000` | OpenCV FFmpeg 后端读取视频帧的超时时间，单位毫秒。底层 FFmpeg RTSP 微秒超时会由该值和打开超时自动换算。 |
 | `CV_READ_ATTEMPTS` | `3` | 单次视频流检测最多尝试读取多少帧。RTSP/HEVC 偶发坏帧时，提高该值可以降低误判。 |
 | `CV_READ_RETRY_DELAY_SECONDS` | `0.3` | 多次读帧之间的等待时间，单位秒。 |
 | `PREFER_H264_STREAM` | `True` | ONVIF 选流时优先选择 H.264，再按分辨率最低选择。设置为 `false` 时仅按低分辨率优先。 |
@@ -356,6 +364,10 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `onvif_exporter_onvif_max_concurrency` | Gauge | `/metrics` | 无 | 当前 ONVIF 网络请求线程最大并发数。 |
 | `onvif_exporter_cv_queue_capacity` | Gauge | `/metrics` | 无 | 当前 CV 后台刷新队列容量。 |
 | `onvif_exporter_cap_prop_buffersize` | Gauge | `/metrics` | 无 | 当前 OpenCV `CAP_PROP_BUFFERSIZE` 配置值。 |
+| `onvif_exporter_cv_open_attempts` | Gauge | `/metrics` | 无 | 当前单次 CV 检测最大 RTSP 连接建立次数。 |
+| `onvif_exporter_cv_open_retry_delay_seconds` | Gauge | `/metrics` | 无 | 当前 RTSP 连接重试间隔秒数。 |
+| `onvif_exporter_cv_open_timeout_msec` | Gauge | `/metrics` | 无 | 当前 OpenCV 打开 RTSP 连接超时毫秒数。 |
+| `onvif_exporter_cv_read_timeout_msec` | Gauge | `/metrics` | 无 | 当前 OpenCV 读取 RTSP 视频帧超时毫秒数。 |
 | `onvif_exporter_cv_read_attempts` | Gauge | `/metrics` | 无 | 当前单次 CV 检测最大读帧次数。 |
 | `onvif_exporter_cv_read_retry_delay_seconds` | Gauge | `/metrics` | 无 | 当前多次读帧之间等待秒数。 |
 | `onvif_exporter_prefer_h264_stream` | Gauge | `/metrics` | 无 | 当前是否启用 H.264 优先选流。`1` 表示启用。 |

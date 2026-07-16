@@ -95,6 +95,13 @@ FFMPEG_AUDIO_TIMEOUT_SECONDS = float(os.getenv("FFMPEG_AUDIO_TIMEOUT_SECONDS", "
 AUDIO_UNKNOWN_VOLUME_DB = -99.0
 # OpenCV 侧 RTSP 缓冲帧数。部分 FFmpeg 后端可能不完全遵守该参数，但保留为可调项。
 CAP_PROP_BUFFERSIZE = max(0, int(os.getenv("CAP_PROP_BUFFERSIZE", "1")))
+# 单次视频流检测最多重新建立多少次 RTSP 连接。每次重试都会创建新的 VideoCapture。
+CV_OPEN_ATTEMPTS = max(1, int(os.getenv("CV_OPEN_ATTEMPTS", "3")))
+# RTSP 连接重试间隔，避免摄像机连接瞬时抖动直接写入失败状态。
+CV_OPEN_RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("CV_OPEN_RETRY_DELAY_SECONDS", "0.5")))
+# OpenCV FFmpeg 后端打开和读帧超时。VideoCapture 参数单位为毫秒。
+CV_OPEN_TIMEOUT_MSEC = max(100, int(os.getenv("CV_OPEN_TIMEOUT_MSEC", "3000")))
+CV_READ_TIMEOUT_MSEC = max(100, int(os.getenv("CV_READ_TIMEOUT_MSEC", "3000")))
 # CV 单次检测最多尝试读取多少帧。RTSP/HEVC 偶发丢参考帧时，单帧读取容易误判为无流。
 CV_READ_ATTEMPTS = max(1, int(os.getenv("CV_READ_ATTEMPTS", "3")))
 # 多次读帧之间的等待时间，给 RTSP/解码器一点时间等到可解码帧。
@@ -226,7 +233,8 @@ async def lifespan(app: FastAPI):
     * 描述: {APP_DESC}
     * CV 调度 worker: {CV_WORKER_COUNT} workers x {CV_WORKER_TASK_LIMIT} tasks/worker = {CV_WORKER_SLOT_COUNT} process slots
     * CV 子进程任务上限: {CV_PROCESS_MAX_TASKS} tasks/child
-    * CV 单次读帧尝试: {CV_READ_ATTEMPTS} 次 / 间隔 {CV_READ_RETRY_DELAY_SECONDS}s / buffer={CAP_PROP_BUFFERSIZE}
+    * CV RTSP 打开尝试: {CV_OPEN_ATTEMPTS} 次 / 间隔 {CV_OPEN_RETRY_DELAY_SECONDS}s / open_timeout={CV_OPEN_TIMEOUT_MSEC}ms / read_timeout={CV_READ_TIMEOUT_MSEC}ms
+    * CV 单连接读帧尝试: {CV_READ_ATTEMPTS} 次 / 间隔 {CV_READ_RETRY_DELAY_SECONDS}s / buffer={CAP_PROP_BUFFERSIZE}
     * ONVIF 选流策略: {"优先 H.264" if PREFER_H264_STREAM else "仅按最低分辨率"}
     * ONVIF 线程并发数: {ONVIF_MAX_CONCURRENCY} (Thread Pool)
     * 缓存机制: stream={STREAM_CACHE_TTL}s / analysis={ANALYSIS_CACHE_TTL}s / {REFRESH_THRESHOLD}s 静默刷新 / 最多 {CV_CACHE_MAX_ENTRIES} targets
@@ -341,59 +349,93 @@ def sync_detect_stream_frame(stream_uri: str):
     """
     result = {
         "stream_exists": False,
-        "analysis": build_default_analysis_data()
+        "analysis": build_default_analysis_data(),
+        "capture_opened": False,
+        "open_attempts": 0,
+        "read_attempts": 0
     }
+    frame = None
+    last_error = None
 
     try:
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|threads;1|timeout;3000"
-        cap = cv2.VideoCapture(stream_uri)
-        if CAP_PROP_BUFFERSIZE > 0:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, CAP_PROP_BUFFERSIZE)
+        # FFmpeg 的 RTSP timeout 单位是微秒；这里与 OpenCV 的毫秒超时保持一致。
+        ffmpeg_timeout_usec = max(CV_OPEN_TIMEOUT_MSEC, CV_READ_TIMEOUT_MSEC) * 1000
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;tcp|threads;1|timeout;{ffmpeg_timeout_usec}"
+        )
 
-        if cap.isOpened():
-            frame = None
-            for attempt in range(1, CV_READ_ATTEMPTS + 1):
-                ret, candidate_frame = cap.read()
-                if ret and candidate_frame is not None and candidate_frame.size > 0:
-                    frame = candidate_frame
-                    break
+        for open_attempt in range(1, CV_OPEN_ATTEMPTS + 1):
+            result["open_attempts"] = open_attempt
+            cap = None
+            try:
+                cap = cv2.VideoCapture(
+                    stream_uri,
+                    cv2.CAP_FFMPEG,
+                    [
+                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                        CV_OPEN_TIMEOUT_MSEC,
+                        cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                        CV_READ_TIMEOUT_MSEC
+                    ]
+                )
+                if CAP_PROP_BUFFERSIZE > 0:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, CAP_PROP_BUFFERSIZE)
 
-                if candidate_frame is not None:
-                    del candidate_frame
-                if attempt < CV_READ_ATTEMPTS and CV_READ_RETRY_DELAY_SECONDS > 0:
-                    time.sleep(CV_READ_RETRY_DELAY_SECONDS)
+                if cap.isOpened():
+                    result["capture_opened"] = True
+                    for read_attempt in range(1, CV_READ_ATTEMPTS + 1):
+                        result["read_attempts"] += 1
+                        ret, candidate_frame = cap.read()
+                        if ret and candidate_frame is not None and candidate_frame.size > 0:
+                            frame = candidate_frame
+                            break
+
+                        if candidate_frame is not None:
+                            del candidate_frame
+                        if read_attempt < CV_READ_ATTEMPTS and CV_READ_RETRY_DELAY_SECONDS > 0:
+                            time.sleep(CV_READ_RETRY_DELAY_SECONDS)
+            except Exception as e:
+                last_error = e
+            finally:
+                if cap is not None:
+                    cap.release()
 
             if frame is not None:
-                result["stream_exists"] = True
-                analysis = result["analysis"]
+                break
+            if open_attempt < CV_OPEN_ATTEMPTS and CV_OPEN_RETRY_DELAY_SECONDS > 0:
+                time.sleep(CV_OPEN_RETRY_DELAY_SECONDS)
 
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                analysis["sharpness"] = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if frame is not None:
+            result["stream_exists"] = True
+            analysis = result["analysis"]
 
-                brightness = cv2.mean(gray)[0]
-                analysis["brightness"] = brightness
-                if brightness < BLACK_THRESHOLD:
-                    analysis["is_black"] = True
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            analysis["sharpness"] = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-                _, std_dev = cv2.meanStdDev(gray)
-                analysis["contrast"] = std_dev[0][0]
+            brightness = cv2.mean(gray)[0]
+            analysis["brightness"] = brightness
+            if brightness < BLACK_THRESHOLD:
+                analysis["is_black"] = True
 
-                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-                analysis["saturation"] = cv2.mean(hsv[:, :, 1])[0]
+            _, std_dev = cv2.meanStdDev(gray)
+            analysis["contrast"] = std_dev[0][0]
 
-                mean_bgr = cv2.mean(frame)
-                mean_b = mean_bgr[0]
-                analysis["rb_ratio"] = mean_bgr[2] / (mean_b + 1e-5)
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            analysis["saturation"] = cv2.mean(hsv[:, :, 1])[0]
 
-                del frame, gray, hsv
+            mean_bgr = cv2.mean(frame)
+            mean_b = mean_bgr[0]
+            analysis["rb_ratio"] = mean_bgr[2] / (mean_b + 1e-5)
 
-        cap.release()
+            del gray, hsv
+        elif last_error is not None:
+            print(f"视频帧检测重试后仍异常: {last_error}")
 
     except Exception as e:
         print(f"视频帧检测进程异常: {e}")
     finally:
-        if 'cap' in locals(): cap.release()
-        if 'frame' in locals(): del frame
+        if frame is not None:
+            del frame
 
     return result
 
@@ -715,6 +757,9 @@ async def cv_worker(worker_id: int, slot_id: int):
         task_started = time.perf_counter()
         stagger_sleep = 0.0
         frame_elapsed = None
+        frame_capture_opened = None
+        frame_open_attempts = None
+        frame_read_attempts = None
         audio_elapsed = None
         audio_status = "skipped"
         stream_exists = False
@@ -725,6 +770,9 @@ async def cv_worker(worker_id: int, slot_id: int):
             frame_started = time.perf_counter()
             frame_data = await loop.run_in_executor(process_pool, sync_detect_stream_frame, auth_uri)
             frame_elapsed = time.perf_counter() - frame_started
+            frame_capture_opened = frame_data["capture_opened"]
+            frame_open_attempts = frame_data["open_attempts"]
+            frame_read_attempts = frame_data["read_attempts"]
             now = time.time()
             stream_exists = frame_data["stream_exists"]
 
@@ -767,6 +815,9 @@ async def cv_worker(worker_id: int, slot_id: int):
                 f"cv_worker target={cache_key} worker={worker_id} slot={slot_id} "
                 f"stream_exists={1 if stream_exists else 0} total={format_diag_seconds(time.perf_counter() - task_started)} "
                 f"stagger={format_diag_seconds(stagger_sleep)} frame={format_diag_seconds(frame_elapsed)} "
+                f"capture_opened={1 if frame_capture_opened else 0 if frame_capture_opened is not None else 'n/a'} "
+                f"open_attempts={frame_open_attempts if frame_open_attempts is not None else 'n/a'} "
+                f"read_attempts={frame_read_attempts if frame_read_attempts is not None else 'n/a'} "
                 f"audio={format_diag_seconds(audio_elapsed)} audio_status={audio_status} "
                 f"queue_size={cv_queue.qsize()} probing_targets={len(cv_probing_targets)} "
                 f"stream_cache_entries={len(cv_stream_cache)} analysis_cache_entries={len(cv_analysis_cache)}"
@@ -1013,6 +1064,10 @@ async def metrics():
         f"onvif_exporter_onvif_max_concurrency {ONVIF_MAX_CONCURRENCY}\n"
         f"onvif_exporter_cv_queue_capacity {CV_QUEUE_MAXSIZE}\n"
         f"onvif_exporter_cap_prop_buffersize {CAP_PROP_BUFFERSIZE}\n"
+        f"onvif_exporter_cv_open_attempts {CV_OPEN_ATTEMPTS}\n"
+        f"onvif_exporter_cv_open_retry_delay_seconds {CV_OPEN_RETRY_DELAY_SECONDS}\n"
+        f"onvif_exporter_cv_open_timeout_msec {CV_OPEN_TIMEOUT_MSEC}\n"
+        f"onvif_exporter_cv_read_timeout_msec {CV_READ_TIMEOUT_MSEC}\n"
         f"onvif_exporter_cv_read_attempts {CV_READ_ATTEMPTS}\n"
         f"onvif_exporter_cv_read_retry_delay_seconds {CV_READ_RETRY_DELAY_SECONDS}\n"
         f"onvif_exporter_prefer_h264_stream {1 if PREFER_H264_STREAM else 0}\n"
