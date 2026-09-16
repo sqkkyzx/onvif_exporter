@@ -18,6 +18,7 @@
 * **🧵 多 worker 自动分配**: 通过 `CV_WORKER_COUNT * CV_WORKER_TASK_LIMIT` 控制 CV 总任务槽位，让不同摄像机并行刷新，避免多路设备串行等待。
 * **🛡️ 进程级内存隔离与回收 (OOM Protection)**: 针对高分辨率视频监控，将底层 C++ 库（OpenCV/FFmpeg）封装进独立进程池，并定期重建 CV 子进程，降低 native 内存长期累积导致卡顿的风险。
 * **📉 H.264 优先低分辨率取流**: 通过 ONVIF `GetProfiles()` 读取所有媒体 Profile，默认优先选择 H.264，再选择低分辨率 RTSP 流进行 CV 分析，降低边缘节点 CPU 与内存压力并避开 HEVC 抖动。
+* **🎙️ 音频独立选流（开发中）**: 视频继续使用低分辨率流，音量检测根据 ONVIF 音频配置选择候选 Profile；次码流没有音频时可使用带音频的主码流。以下音频选流及状态指标变更尚未包含在已发布的 `1.0.0b1` 镜像中。
 * **🧩 流状态与分析结果分离缓存**: `onvif_video_stream_exists` 只表示最近是否读到视频首帧；亮度、黑屏、清晰度、音量等分析结果单独缓存，慢分析不会拖慢流状态落库。
 * **🎯 动态期望阈值巡检**: 独创的 Label 映射魔法。支持为成百上千个摄像头单独下发 `expected_pan/tilt/zoom` 期望坐标，一旦设备被人为恶意扭动导致偏离，即可触发精准告警。
 * **👁️ CV 画面与硬件故障分析**:
@@ -178,6 +179,18 @@ CV_WORKER_COUNT=1 CV_WORKER_TASK_LIMIT=1 ONVIF_MAX_CONCURRENCY=4 ./onvif-exporte
 * 如果 `/metrics` 中 `onvif_exporter_cv_queue_size` 长期接近 `CV_QUEUE_MAXSIZE`，说明视频分析跟不上抓取速度。低内存机器优先增大 `REFRESH_THRESHOLD`、增大 `STREAM_CACHE_TTL` / `ANALYSIS_CACHE_TTL` 或降低 Prometheus `scrape_interval` 频率；只有内存和 CPU 还有余量时，才增加 worker slots。
 * 如果摄像头数量很多，建议让 `STREAM_CACHE_TTL` 大于 `REFRESH_THRESHOLD` 至少 60 秒，减少缓存过期窗口。
 
+### 音频检测与排查
+
+视频选流按编码优先级、分辨率排序，不依赖厂商的“主码流/次码流”名称。因此 H.264 主码流可能优先于 H.265 次码流。
+
+开发版将音频选流与视频选流分开：优先尝试当前视频 Profile（如果声明了音频源或音频编码配置），再按低分辨率优先尝试其他声明音频的 Profile，首次测到音量即停止。明确属于不同视频源的 Profile 会被排除；设备未提供源标识时无法据此区分通道。配置声明只是候选线索，不保证 RTSP 中实际存在音轨；原视频 URI 始终作为兜底，兼容设备漏报音频配置。备用 URI 查询使用共享 2 秒预算分配连接和读取超时，失败后继续使用已取得的候选。FFmpeg 音量采样仅请求音频媒体，避免回退主码流时同时接收高码率视频。
+
+`onvif_audio_mean_volume_db=-99` 表示当前没有取得音量结果，可能尚未采样、没有音轨、鉴权失败或超时，不能当作实际静音。视频刷新后，音量采样完成前也可能短暂为 `-99`。开发版新增 `onvif_audio_probe_success` 和成功采样的 `onvif_audio_stream_profile_info`，用于区分结果是否有效及实际使用的音频 Profile；结合 `onvif_video_analysis_cache_valid` 判断结果是否过期。
+
+默认每个音频候选最多运行 `FFMPEG_AUDIO_TIMEOUT_SECONDS=8` 秒，包含 RTSP 建连、探测和 `FFMPEG_AUDIO_SAMPLE_SECONDS=2` 秒采样。多候选连续失败会增加 worker 占用时间，最坏接近候选数乘以该超时。只有日志确认是超时时，才考虑提高该值。
+
+排查时检查 `[BETA-DIAG] onvif_profiles` 中的音频配置与候选 Profile，以及音频尝试和 `cv_worker` 的日志。`FFmpeg 音频检测失败` 表示需要查看对应错误；必要时临时打开 `EXPORTER_FFMPEG_VERBOSE_ERROR=true` 获取完整 stderr。分享日志前应遮掉 RTSP URI 中的账号密码。
+
 ---
 
 ## ⚙️ Prometheus 配置指南
@@ -335,6 +348,8 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `onvif_device_info` | Gauge | `/probe` | `manufacturer`, `model`, `firmware`, `mac`, `encoding` | 设备静态信息，值固定为 `1`，具体信息通过 labels 表示。 |
 | `onvif_system_time_drift_seconds` | Gauge | `/probe` | 无 | 摄像头 UTC 系统时间与 Exporter 服务器时间的漂移秒数。正数表示摄像头时间落后于服务器。 |
 | `onvif_video_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 实际用于 RTSP/CV 分析的 ONVIF 媒体 Profile。默认优先选择 H.264，再在同编码优先级内选择低分辨率 Profile。 |
+| `onvif_audio_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 开发版：最近一次分析中成功测到音量的音频 Profile；没有成功结果时不输出样本。可能与视频 Profile 不同。 |
+| `onvif_audio_probe_success` | Gauge | `/probe` | 无 | 开发版：当前分析缓存中存在成功音量结果为 `1`，待采样或失败为 `0`。结合分析缓存有效性指标判断是否过期。 |
 | `onvif_video_resolution_width` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率宽度。 |
 | `onvif_video_resolution_height` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率高度。 |
 | `onvif_video_framerate_limit` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码帧率上限。 |
@@ -352,7 +367,7 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `onvif_video_analysis_cache_valid` | Gauge | `/probe` | 无 | 视频分析结果缓存是否仍在 `ANALYSIS_CACHE_TTL` 内。`0` 表示分析结果不是新鲜数据。 |
 | `onvif_video_analysis_cache_age_seconds` | Gauge | `/probe` | 无 | 视频分析结果缓存年龄，单位秒；无缓存时为 `-1`。 |
 | `onvif_video_is_black_screen` | Gauge | `/probe` | 无 | 黑屏判定。`1` 表示平均亮度低于 `BLACK_THRESHOLD`，`0` 表示未判定为黑屏。 |
-| `onvif_audio_mean_volume_db` | Gauge | `/probe` | 无 | FFmpeg `volumedetect` 计算得到的平均音量 dB。默认静音/未知值为 `-99.0`。 |
+| `onvif_audio_mean_volume_db` | Gauge | `/probe` | 无 | FFmpeg `volumedetect` 计算得到的平均音量 dB。未取得结果时为 `-99.0`，该占位值不代表实际静音。 |
 | `onvif_video_cv_brightness` | Gauge | `/probe` | 无 | 首帧灰度平均亮度，范围约 `0-255`。 |
 | `onvif_video_cv_contrast` | Gauge | `/probe` | 无 | 首帧灰度标准差，用于表示画面对比度。 |
 | `onvif_video_cv_saturation` | Gauge | `/probe` | 无 | HSV 饱和度通道平均值，用于观察画面色彩饱和程度。 |
@@ -474,12 +489,12 @@ groups:
           description: "{{ $labels.instance }} 红蓝通道比明显异常，可能是 IR-Cut 滤光片或白平衡问题。"
 
       - alert: OnvifAudioSilent
-        expr: onvif_audio_mean_volume_db <= -90
+        expr: (onvif_audio_mean_volume_db <= -90) and (onvif_audio_mean_volume_db != -99) and (onvif_video_analysis_cache_valid == 1)
         for: 15m
         labels:
           severity: info
         annotations:
-          summary: "摄像机音频疑似静音或无音频"
+          summary: "摄像机音频疑似静音"
           description: "{{ $labels.instance }} 平均音量长期接近静音。若该点位不需要音频，可忽略此告警。"
 
       - alert: OnvifCameraTimeDrift

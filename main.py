@@ -303,7 +303,8 @@ def detect_audio_volume_db(stream_uri: str) -> float | None:
     `rw_timeout` for RTSP inputs. Keeping the FFmpeg arguments minimal and using
     subprocess timeout is more portable while still preventing stuck probes.
     """
-    audio_stream = ffmpeg.input(stream_uri, rtsp_transport='tcp').audio
+    # An audio fallback may use the main profile; do not also receive its video.
+    audio_stream = ffmpeg.input(stream_uri, rtsp_transport='tcp', allowed_media_types='audio').audio
     command = (
         audio_stream
         .filter('volumedetect')
@@ -334,6 +335,9 @@ def build_default_analysis_data():
     return {
         "is_black": False,
         "audio_volume_db": AUDIO_UNKNOWN_VOLUME_DB,
+        "audio_probe_success": False,
+        "audio_profile_token": "",
+        "audio_profile_name": "",
         "brightness": 0.0,
         "contrast": 0.0,
         "saturation": 0.0,
@@ -453,6 +457,28 @@ def sync_detect_audio_volume(stream_uri: str):
     return None
 
 
+def sync_detect_audio_candidates(candidates):
+    """Try advertised audio profiles until FFmpeg actually decodes audio."""
+    attempts = []
+    for candidate in candidates:
+        started = time.perf_counter()
+        volume_db = sync_detect_audio_volume(candidate["uri"])
+        attempts.append({
+            "profile_token": candidate["profile_token"],
+            "profile_name": candidate["profile_name"],
+            "success": volume_db is not None,
+            "elapsed": time.perf_counter() - started
+        })
+        if volume_db is not None:
+            return {
+                "audio_volume_db": volume_db,
+                "audio_probe_success": True,
+                "audio_profile_token": candidate["profile_token"],
+                "audio_profile_name": candidate["profile_name"]
+            }, attempts
+    return None, attempts
+
+
 def cleanup_cv_cache(now: float):
     """限制 CV 缓存增长，避免动态 target 或异常请求导致常驻内存持续上涨。"""
     global last_cv_cache_clean
@@ -546,8 +572,104 @@ def describe_profile_for_diag(index: int, profile) -> str:
         f"{index}:token={getattr(profile, 'token', '')},"
         f"name={str(getattr(profile, 'Name', '') or '')},"
         f"encoding={encoding},resolution={width}x{height},"
+        f"audio_config={1 if profile_has_audio(profile) else 0},"
         f"codec_priority={get_profile_codec_priority(profile)}"
     )
+
+
+def profile_has_audio(profile) -> bool:
+    """Return whether an ONVIF media profile advertises an audio source/encoder."""
+    return any(
+        getattr(profile, attr, None) is not None
+        for attr in ("AudioSourceConfiguration", "AudioEncoderConfiguration")
+    )
+
+
+def get_profile_video_source_token(profile) -> str | None:
+    config = getattr(profile, "VideoSourceConfiguration", None)
+    token = getattr(config, "SourceToken", None)
+    return str(token) if token is not None and str(token) else None
+
+
+def select_audio_profiles(profiles, preferred_profile):
+    """Order advertised audio candidates; metadata is a hint, not proof of audio."""
+    preferred_source_token = get_profile_video_source_token(preferred_profile)
+    candidates = [
+        (
+            0 if profile is preferred_profile else 1,
+            get_profile_resolution(profile) or (0, 0),
+            index,
+            profile
+        )
+        for index, profile in enumerate(profiles)
+        if profile_has_audio(profile)
+        and (
+            preferred_source_token is None
+            or get_profile_video_source_token(profile) in (None, preferred_source_token)
+        )
+    ]
+    ordered = [item[3] for item in sorted(candidates, key=lambda item: (item[0], item[1][0] * item[1][1], item[2]))]
+    if not any(profile is preferred_profile for profile in ordered):
+        # Missing ONVIF metadata must not exclude a video stream that carries audio.
+        ordered.append(preferred_profile)
+    return ordered
+
+
+def get_profile_stream_uri(media_service, profile, target: str) -> str:
+    req = media_service.create_type('GetStreamUri')
+    req.ProfileToken = profile.token
+    req.StreamSetup = {'Stream': 'RTP-Unicast', 'Transport': {'Protocol': 'RTSP'}}
+    stream_uri = media_service.GetStreamUri(req).Uri
+    parsed_rtsp = urllib.parse.urlparse(stream_uri)
+    if parsed_rtsp.hostname in ['0.0.0.0', '127.0.0.1', 'localhost']:
+        rtsp_port = parsed_rtsp.port if parsed_rtsp.port else 554
+        fixed_rtsp_netloc = f"{target}:{rtsp_port}"
+        stream_uri = parsed_rtsp._replace(netloc=fixed_rtsp_netloc).geturl()
+    return stream_uri
+
+
+def get_audio_stream_candidates(media_service, profiles, stream_profile, stream_uri: str, target: str):
+    """Resolve audio URIs without letting unsupported profiles fail the video probe."""
+    candidates = []
+    seen_uris = set()
+    # Optional URI lookups share a small budget. Zeep otherwise has no SOAP
+    # operation timeout, so one unsupported audio profile could block /probe.
+    lookup_deadline = time.monotonic() + 2.0
+    for profile in select_audio_profiles(profiles, stream_profile):
+        try:
+            if profile is stream_profile:
+                uri = stream_uri
+            else:
+                remaining = lookup_deadline - time.monotonic()
+                if remaining <= 0:
+                    continue
+                transport = media_service.zeep_client.transport
+                previous_timeout = transport.operation_timeout
+                # requests uses separate connect/read timeouts. Restore the
+                # transport even on exceptions; each camera owns this client.
+                transport.operation_timeout = (remaining / 2, remaining / 2)
+                try:
+                    uri = get_profile_stream_uri(media_service, profile, target)
+                finally:
+                    transport.operation_timeout = previous_timeout
+        except Exception as exc:
+            logger.warning("获取音频流地址失败: target=%s profile=%s error=%s", target, profile.token, exc)
+            continue
+        if uri in seen_uris:
+            continue
+        seen_uris.add(uri)
+        candidates.append({
+            "uri": uri,
+            "profile_token": str(profile.token),
+            "profile_name": str(getattr(profile, "Name", "") or "")
+        })
+    if not candidates:
+        candidates.append({
+            "uri": stream_uri,
+            "profile_token": str(stream_profile.token),
+            "profile_name": str(getattr(stream_profile, "Name", "") or "")
+        })
+    return candidates
 
 
 def select_lowest_resolution_profile(profiles):
@@ -626,16 +748,8 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
 
         stream_token = stream_profile.token
         ptz_token = ptz_profile.token
-        req = media_service.create_type('GetStreamUri')
-        req.ProfileToken = stream_token
-        req.StreamSetup = {'Stream': 'RTP-Unicast', 'Transport': {'Protocol': 'RTSP'}}
-
-        stream_uri = media_service.GetStreamUri(req).Uri
-        parsed_rtsp = urllib.parse.urlparse(stream_uri)
-        if parsed_rtsp.hostname in ['0.0.0.0', '127.0.0.1', 'localhost']:
-            rtsp_port = parsed_rtsp.port if parsed_rtsp.port else 554
-            fixed_rtsp_netloc = f"{target}:{rtsp_port}"
-            stream_uri = parsed_rtsp._replace(netloc=fixed_rtsp_netloc).geturl()
+        stream_uri = get_profile_stream_uri(media_service, stream_profile, target)
+        audio_candidates = get_audio_stream_candidates(media_service, profiles, stream_profile, stream_uri, target)
 
         video_conf = stream_profile.VideoEncoderConfiguration
         rate_control = getattr(video_conf, "RateControl", None)
@@ -646,13 +760,15 @@ def sync_onvif_probe(target: str, user: str, password: str, port: int = 80):
             "fps": getattr(rate_control, "FrameRateLimit", 0) if rate_control is not None else 0,
             "encoding": getattr(video_conf, "Encoding", "unknown"),
             "profile_token": str(stream_token),
-            "profile_name": str(getattr(stream_profile, "Name", "") or "")
+            "profile_name": str(getattr(stream_profile, "Name", "") or ""),
+            "audio_candidates": audio_candidates
         }
         beta_diag_log(
             f"onvif_profiles target={target} port={port} "
             f"selected_token={video_metrics['profile_token']} selected_name={video_metrics['profile_name']} "
             f"selected_encoding={video_metrics['encoding']} selected_resolution={stream_width}x{stream_height} "
             f"rtsp_endpoint={format_rtsp_endpoint(stream_uri)} "
+            f"audio_candidates=[{','.join(candidate['profile_token'] for candidate in audio_candidates)}] "
             f"profiles=[{'; '.join(describe_profile_for_diag(index, profile) for index, profile in enumerate(profiles))}]"
         )
 
@@ -753,7 +869,7 @@ async def cv_worker(worker_id: int, slot_id: int):
     """后台工作协程：专门负责消耗资源的 CV 拉流解析"""
     loop = asyncio.get_running_loop()
     while True:
-        cache_key, auth_uri = await cv_queue.get()
+        cache_key, auth_uri, audio_candidates = await cv_queue.get()
         task_started = time.perf_counter()
         stagger_sleep = 0.0
         frame_elapsed = None
@@ -793,12 +909,18 @@ async def cv_worker(worker_id: int, slot_id: int):
 
                 # STEP 2: 音频是慢分析，单独补齐到分析缓存；失败时保留图像分析结果。
                 audio_started = time.perf_counter()
-                audio_volume_db = await loop.run_in_executor(process_pool, sync_detect_audio_volume, auth_uri)
+                audio_result, audio_attempts = await loop.run_in_executor(process_pool, sync_detect_audio_candidates, audio_candidates)
                 audio_elapsed = time.perf_counter() - audio_started
-                if audio_volume_db is not None:
+                for attempt in audio_attempts:
+                    beta_diag_log(
+                        f"audio_probe target={cache_key} profile_token={attempt['profile_token']} "
+                        f"profile_name={attempt['profile_name']} result={'success' if attempt['success'] else 'failed'} "
+                        f"elapsed={format_diag_seconds(attempt['elapsed'])}"
+                    )
+                if audio_result is not None:
                     audio_status = "updated"
                     analysis_data = dict(analysis_data)
-                    analysis_data["audio_volume_db"] = audio_volume_db
+                    analysis_data.update(audio_result)
                     cv_analysis_cache[cache_key] = {
                         "time": time.time(),
                         "data": analysis_data
@@ -874,6 +996,9 @@ async def probe(
     metric_stream_exists = Gauge('onvif_video_stream_exists', '视频流是否成功读取', registry=registry)
     metric_is_black = Gauge('onvif_video_is_black_screen', '视频是否黑屏', registry=registry)
     metric_audio_vol = Gauge('onvif_audio_mean_volume_db', '音频平均音量(dB)', registry=registry)
+    metric_audio_probe_success = Gauge('onvif_audio_probe_success', '最近一次音频分析是否成功，未分析或失败为0', registry=registry)
+    metric_audio_profile_info = Gauge('onvif_audio_stream_profile_info', '最近成功音频分析使用的ONVIF媒体Profile',
+                                      ['token', 'name'], registry=registry)
     metric_cv_brightness = Gauge('onvif_video_cv_brightness', '图像平均亮度', registry=registry)
     metric_cv_contrast = Gauge('onvif_video_cv_contrast', '图像对比度', registry=registry)
     metric_cv_saturation = Gauge('onvif_video_cv_saturation', '图像平均饱和度', registry=registry)
@@ -950,8 +1075,12 @@ async def probe(
             else:
                 cv_probing_targets.add(cache_key)
                 auth_uri = build_authenticated_rtsp_uri(stream_uri, user, password)
+                audio_candidates = [
+                    {**candidate, "uri": build_authenticated_rtsp_uri(candidate["uri"], user, password)}
+                    for candidate in video_metrics["audio_candidates"]
+                ]
                 try:
-                    cv_queue.put_nowait((cache_key, auth_uri))
+                    cv_queue.put_nowait((cache_key, auth_uri, audio_candidates))
                     enqueue_state = "queued"
                 except asyncio.QueueFull:
                     enqueue_state = "queue_full"
@@ -980,6 +1109,10 @@ async def probe(
 
         metric_is_black.set(1 if analysis_data['is_black'] else 0)
         metric_audio_vol.set(analysis_data['audio_volume_db'])
+        metric_audio_probe_success.set(1 if analysis_data['audio_probe_success'] else 0)
+        if analysis_data['audio_probe_success']:
+            metric_audio_profile_info.labels(token=analysis_data['audio_profile_token'],
+                                             name=analysis_data['audio_profile_name']).set(1)
         metric_cv_brightness.set(analysis_data['brightness'])
         metric_cv_contrast.set(analysis_data['contrast'])
         metric_cv_saturation.set(analysis_data['saturation'])
