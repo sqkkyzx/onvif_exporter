@@ -18,7 +18,7 @@
 * **🧵 多 worker 自动分配**: 通过 `CV_WORKER_COUNT * CV_WORKER_TASK_LIMIT` 控制 CV 总任务槽位，让不同摄像机并行刷新，避免多路设备串行等待。
 * **🛡️ 进程级内存隔离与回收 (OOM Protection)**: 针对高分辨率视频监控，将底层 C++ 库（OpenCV/FFmpeg）封装进独立进程池，并定期重建 CV 子进程，降低 native 内存长期累积导致卡顿的风险。
 * **📉 H.264 优先低分辨率取流**: 通过 ONVIF `GetProfiles()` 读取所有媒体 Profile，默认优先选择 H.264，再选择低分辨率 RTSP 流进行 CV 分析，降低边缘节点 CPU 与内存压力并避开 HEVC 抖动。
-* **🎙️ 音频独立选流（开发中）**: 视频继续使用低分辨率流，音量检测根据 ONVIF 音频配置选择候选 Profile；次码流没有音频时可使用带音频的主码流。以下音频选流及状态指标变更尚未包含在已发布的 `1.0.0b1` 镜像中。
+* **🎙️ 音频独立选流与人声检测**: 视频继续使用低分辨率流，音量检测根据 ONVIF 音频配置选择候选 Profile；次码流没有音频时可使用带音频的主码流，并可通过 WebRTC VAD 判断人声活动。
 * **🧩 流状态与分析结果分离缓存**: `onvif_video_stream_exists` 只表示最近是否读到视频首帧；亮度、黑屏、清晰度、音量等分析结果单独缓存，慢分析不会拖慢流状态落库。
 * **🎯 动态期望阈值巡检**: 独创的 Label 映射魔法。支持为成百上千个摄像头单独下发 `expected_pan/tilt/zoom` 期望坐标，一旦设备被人为恶意扭动导致偏离，即可触发精准告警。
 * **👁️ CV 画面与硬件故障分析**:
@@ -36,7 +36,7 @@
 
 我们提供了预构建的开箱即用 Docker 镜像，内置了完整的 Python 环境及 FFmpeg/OpenCV 底层依赖，推荐使用 Docker 部署。
 
-当前 `1.0.0b1` 是 beta 版本。Docker 镜像 tag、Git tag、GitHub Release tag 和二进制包名都统一使用 `1.0.0b1`；beta 版本不会覆盖 `latest`。
+当前 `1.0.0b2` 是 beta 版本。Docker 镜像 tag、Git tag、GitHub Release tag 和二进制包名都统一使用 `1.0.0b2`；beta 版本不会覆盖 `latest`。
 
 该 beta 版本硬编码开启紫色 `[BETA-DIAG]` 诊断日志，用于观察单次 `/probe` 总耗时、ONVIF 耗时、CV 队列决策、worker 分段耗时、选流结果和缓存清理行为；正式版发布前会直接从代码中关闭或移除。
 
@@ -61,10 +61,10 @@ docker run -d \
   -e CV_CACHE_CLEAN_INTERVAL=120 \
   -e BLACK_THRESHOLD=15 \
   -e STRICT_ZERO_PTZ_CHECK=true \
-  sqkkyzx/onvif_exporter:1.0.0b1
+  sqkkyzx/onvif_exporter:1.0.0b2
   
 # 备用镜像源 (GHCR):
-# ghcr.io/sqkkyzx/onvif_exporter:1.0.0b1
+# ghcr.io/sqkkyzx/onvif_exporter:1.0.0b2
 
 ```
 
@@ -75,7 +75,7 @@ docker run -d \
 ```yaml
 services:
   onvif-exporter:
-    image: sqkkyzx/onvif_exporter:1.0.0b1
+    image: sqkkyzx/onvif_exporter:1.0.0b2
     container_name: onvif-exporter
     ports:
       - "9121:9121"
@@ -199,9 +199,9 @@ CV_WORKER_COUNT=1 CV_WORKER_TASK_LIMIT=1 ONVIF_MAX_CONCURRENCY=4 ./onvif-exporte
 
 视频选流按编码优先级、分辨率排序，不依赖厂商的“主码流/次码流”名称。因此 H.264 主码流可能优先于 H.265 次码流。
 
-开发版将音频选流与视频选流分开：优先尝试当前视频 Profile（如果声明了音频源或音频编码配置），再按低分辨率优先尝试其他声明音频的 Profile，首次测到音量即停止。明确属于不同视频源的 Profile 会被排除；设备未提供源标识时无法据此区分通道。配置声明只是候选线索，不保证 RTSP 中实际存在音轨；原视频 URI 始终作为兜底，兼容设备漏报音频配置。备用 URI 查询使用共享 2 秒预算分配连接和读取超时，失败后继续使用已取得的候选。FFmpeg 音量采样仅请求音频媒体，避免回退主码流时同时接收高码率视频。
+音频选流与视频选流分开：优先尝试当前视频 Profile（如果声明了音频源或音频编码配置），再按低分辨率优先尝试其他声明音频的 Profile，首次测到音量即停止。明确属于不同视频源的 Profile 会被排除；设备未提供源标识时无法据此区分通道。配置声明只是候选线索，不保证 RTSP 中实际存在音轨；原视频 URI 始终作为兜底，兼容设备漏报音频配置。备用 URI 查询使用共享 2 秒预算分配连接和读取超时，失败后继续使用已取得的候选。FFmpeg 音量采样仅请求音频媒体，避免回退主码流时同时接收高码率视频。
 
-`onvif_audio_mean_volume_db=-99` 表示当前没有取得音量结果，可能尚未采样、没有音轨、鉴权失败或超时，不能当作实际静音。视频刷新后，音量采样完成前也可能短暂为 `-99`。开发版新增 `onvif_audio_probe_success` 和成功采样的 `onvif_audio_stream_profile_info`，用于区分结果是否有效及实际使用的音频 Profile；结合 `onvif_video_analysis_cache_valid` 判断结果是否过期。
+`onvif_audio_mean_volume_db=-99` 表示当前没有取得音量结果，可能尚未采样、没有音轨、鉴权失败或超时，不能当作实际静音。视频刷新后，音量采样完成前也可能短暂为 `-99`。可通过 `onvif_audio_probe_success` 和成功采样的 `onvif_audio_stream_profile_info` 区分结果是否有效及实际使用的音频 Profile；结合 `onvif_video_analysis_cache_valid` 判断结果是否过期。
 
 默认每个音频候选最多运行 `FFMPEG_AUDIO_TIMEOUT_SECONDS=8` 秒，包含 RTSP 建连、探测和 `FFMPEG_AUDIO_SAMPLE_SECONDS=2` 秒采样。多候选连续失败会增加 worker 占用时间，最坏接近候选数乘以该超时。只有日志确认是超时时，才考虑提高该值。
 
@@ -364,9 +364,10 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `onvif_device_info` | Gauge | `/probe` | `manufacturer`, `model`, `firmware`, `mac`, `encoding` | 设备静态信息，值固定为 `1`，具体信息通过 labels 表示。 |
 | `onvif_system_time_drift_seconds` | Gauge | `/probe` | 无 | 摄像头 UTC 系统时间与 Exporter 服务器时间的漂移秒数。正数表示摄像头时间落后于服务器。 |
 | `onvif_video_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 实际用于 RTSP/CV 分析的 ONVIF 媒体 Profile。默认优先选择 H.264，再在同编码优先级内选择低分辨率 Profile。 |
-| `onvif_audio_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 开发版：最近一次分析中成功测到音量的音频 Profile；没有成功结果时不输出样本。可能与视频 Profile 不同。 |
-| `onvif_audio_probe_success` | Gauge | `/probe` | 无 | 开发版：当前分析缓存中存在成功音量结果为 `1`，待采样或失败为 `0`。结合分析缓存有效性指标判断是否过期。 |
+| `onvif_audio_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 最近一次分析中成功测到音量的音频 Profile；没有成功结果时不输出样本。可能与视频 Profile 不同。 |
+| `onvif_audio_probe_success` | Gauge | `/probe` | 无 | 当前分析缓存中存在成功音量结果为 `1`，待采样或失败为 `0`。结合分析缓存有效性指标判断是否过期。 |
 | `onvif_audio_vad_active` | Gauge | `/probe` | 无 | 人声活动状态；仅在 `ENABLE_VAD=true` 时有效，由 WebRTC VAD 对 16 kHz 音频帧判定，不是简单音量阈值。 |
+| `onvif_audio_vad_probe_success` | Gauge | `/probe` | 无 | 最近一次 WebRTC VAD 分析是否成功；`0` 时不能把 `onvif_audio_vad_active=0` 解读为无人声。 |
 | `onvif_video_resolution_width` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率宽度。 |
 | `onvif_video_resolution_height` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率高度。 |
 | `onvif_video_framerate_limit` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码帧率上限。 |

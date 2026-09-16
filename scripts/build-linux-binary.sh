@@ -18,17 +18,17 @@ ARCHIVE_NAME="onvif-exporter-linux-x86_64-v${VERSION}"
 
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
-  apt-get install -y --no-install-recommends binutils ffmpeg
+  apt-get install -y --no-install-recommends build-essential binutils ffmpeg
   rm -rf /var/lib/apt/lists/*
 fi
 
-python -m pip install --upgrade pip
-python -m pip install --no-cache-dir pyinstaller
-python -m pip install --no-cache-dir .
+python -m pip install --upgrade pip uv
+uv sync --locked --no-dev
+uv pip install --python .venv/bin/python --no-cache-dir pyinstaller
 
 rm -rf build dist release onvif-exporter.spec "${ARCHIVE_NAME}.spec"
 
-pyinstaller \
+.venv/bin/pyinstaller \
   --clean \
   --noconfirm \
   --onefile \
@@ -40,6 +40,7 @@ pyinstaller \
   --collect-all starlette \
   --collect-all uvicorn \
   --collect-all zeep \
+  --hidden-import _webrtcvad \
   main.py
 
 ./dist/onvif-exporter --version

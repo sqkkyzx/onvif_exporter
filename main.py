@@ -376,6 +376,7 @@ def build_default_analysis_data():
         "audio_volume_db": AUDIO_UNKNOWN_VOLUME_DB,
         "audio_probe_success": False,
         "vad_active": False,
+        "vad_probe_success": False,
         "audio_profile_token": "",
         "audio_profile_name": "",
         "brightness": 0.0,
@@ -514,9 +515,12 @@ def sync_detect_audio_candidates(candidates):
         })
         if volume_db is not None:
             vad_active = False
+            vad_probe_success = False
             if ENABLE_VAD:
                 try:
-                    vad_active = bool(detect_voice_activity(candidate["uri"]))
+                    vad_result = detect_voice_activity(candidate["uri"])
+                    vad_probe_success = vad_result is not None
+                    vad_active = bool(vad_result)
                 except subprocess.TimeoutExpired:
                     logger.error("FFmpeg VAD 超时: timeout=%ss", FFMPEG_AUDIO_TIMEOUT_SECONDS)
                 except Exception as exc:
@@ -525,6 +529,7 @@ def sync_detect_audio_candidates(candidates):
                 "audio_volume_db": volume_db,
                 "audio_probe_success": True,
                 "vad_active": vad_active,
+                "vad_probe_success": vad_probe_success,
                 "audio_profile_token": candidate["profile_token"],
                 "audio_profile_name": candidate["profile_name"]
             }, attempts
@@ -1050,6 +1055,7 @@ async def probe(
     metric_audio_vol = Gauge('onvif_audio_mean_volume_db', '音频平均音量(dB)', registry=registry)
     metric_audio_probe_success = Gauge('onvif_audio_probe_success', '最近一次音频分析是否成功，未分析或失败为0', registry=registry)
     metric_vad_active = Gauge('onvif_audio_vad_active', 'WebRTC VAD 人声活动状态，启用时1表示活动', registry=registry)
+    metric_vad_probe_success = Gauge('onvif_audio_vad_probe_success', '最近一次 WebRTC VAD 分析是否成功', registry=registry)
     metric_audio_profile_info = Gauge('onvif_audio_stream_profile_info', '最近成功音频分析使用的ONVIF媒体Profile',
                                       ['token', 'name'], registry=registry)
     metric_cv_brightness = Gauge('onvif_video_cv_brightness', '图像平均亮度', registry=registry)
@@ -1164,6 +1170,7 @@ async def probe(
         metric_audio_vol.set(analysis_data['audio_volume_db'])
         metric_audio_probe_success.set(1 if analysis_data['audio_probe_success'] else 0)
         metric_vad_active.set(1 if ENABLE_VAD and analysis_data['vad_active'] else 0)
+        metric_vad_probe_success.set(1 if ENABLE_VAD and analysis_data['vad_probe_success'] else 0)
         if analysis_data['audio_probe_success']:
             metric_audio_profile_info.labels(token=analysis_data['audio_profile_token'],
                                              name=analysis_data['audio_profile_name']).set(1)

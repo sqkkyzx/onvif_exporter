@@ -175,6 +175,17 @@ class AudioProfileTests(unittest.TestCase):
         self.assertTrue(result["audio_probe_success"])
         self.assertEqual(result["audio_volume_db"], -99.0)
 
+    def test_vad_success_is_separate_from_voice_activity(self):
+        with (
+            patch.object(main, "ENABLE_VAD", True),
+            patch.object(main, "sync_detect_audio_volume", return_value=-35.0),
+            patch.object(main, "detect_voice_activity", return_value=False),
+        ):
+            result, _ = main.sync_detect_audio_candidates([candidate("audio")])
+
+        self.assertTrue(result["vad_probe_success"])
+        self.assertFalse(result["vad_active"])
+
 
 class AudioWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_authenticates_both_streams_and_exports_actual_audio_profile(self):
