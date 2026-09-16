@@ -109,6 +109,19 @@ CV_READ_RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("CV_READ_RETRY_DELAY_SECO
 # 选流时优先使用 H.264。HEVC/H.265 更容易触发 OpenCV/FFmpeg 解码抖动和更高 CPU 占用。
 PREFER_H264_STREAM = os.getenv("PREFER_H264_STREAM", "True").lower() in ("true", "1", "yes")
 
+def env_enabled(name: str, default: bool = True) -> bool:
+    return os.getenv(name, str(default)).lower() in ("true", "1", "yes", "on")
+
+# 可独立关闭较重的画面/音频质量分析；视频首帧和 ONVIF 状态仍继续探测。
+ENABLE_BRIGHTNESS = env_enabled("ENABLE_BRIGHTNESS")
+ENABLE_CONTRAST = env_enabled("ENABLE_CONTRAST")
+ENABLE_COLOR_TEMPERATURE = env_enabled("ENABLE_COLOR_TEMPERATURE")
+ENABLE_SATURATION = env_enabled("ENABLE_SATURATION")
+ENABLE_SHARPNESS = env_enabled("ENABLE_SHARPNESS")
+ENABLE_VAD = env_enabled("ENABLE_VAD", False)
+# 这是基于音频能量的轻量 VAD：平均音量达到阈值即视为有语音/活动音频。
+VAD_THRESHOLD_DB = float(os.getenv("VAD_THRESHOLD_DB", "-50"))
+
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
 AUTH_PASSWORD = os.getenv("EXPORTER_AUTH_PASSWORD")
@@ -336,6 +349,7 @@ def build_default_analysis_data():
         "is_black": False,
         "audio_volume_db": AUDIO_UNKNOWN_VOLUME_DB,
         "audio_probe_success": False,
+        "vad_active": False,
         "audio_profile_token": "",
         "audio_profile_name": "",
         "brightness": 0.0,
@@ -413,25 +427,28 @@ def sync_detect_stream_frame(stream_uri: str):
             result["stream_exists"] = True
             analysis = result["analysis"]
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            analysis["sharpness"] = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-            brightness = cv2.mean(gray)[0]
-            analysis["brightness"] = brightness
-            if brightness < BLACK_THRESHOLD:
-                analysis["is_black"] = True
-
-            _, std_dev = cv2.meanStdDev(gray)
-            analysis["contrast"] = std_dev[0][0]
-
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            analysis["saturation"] = cv2.mean(hsv[:, :, 1])[0]
-
-            mean_bgr = cv2.mean(frame)
-            mean_b = mean_bgr[0]
-            analysis["rb_ratio"] = mean_bgr[2] / (mean_b + 1e-5)
-
-            del gray, hsv
+            gray = None
+            if ENABLE_BRIGHTNESS or ENABLE_CONTRAST or ENABLE_SHARPNESS:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if ENABLE_SHARPNESS:
+                analysis["sharpness"] = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if ENABLE_BRIGHTNESS:
+                brightness = cv2.mean(gray)[0]
+                analysis["brightness"] = brightness
+                if brightness < BLACK_THRESHOLD:
+                    analysis["is_black"] = True
+            if ENABLE_CONTRAST:
+                _, std_dev = cv2.meanStdDev(gray)
+                analysis["contrast"] = std_dev[0][0]
+            if ENABLE_SATURATION:
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                analysis["saturation"] = cv2.mean(hsv[:, :, 1])[0]
+                del hsv
+            if ENABLE_COLOR_TEMPERATURE:
+                mean_bgr = cv2.mean(frame)
+                analysis["rb_ratio"] = mean_bgr[2] / (mean_bgr[0] + 1e-5)
+            if gray is not None:
+                del gray
         elif last_error is not None:
             print(f"视频帧检测重试后仍异常: {last_error}")
 
@@ -921,6 +938,8 @@ async def cv_worker(worker_id: int, slot_id: int):
                     audio_status = "updated"
                     analysis_data = dict(analysis_data)
                     analysis_data.update(audio_result)
+                    if ENABLE_VAD:
+                        analysis_data["vad_active"] = audio_result["audio_volume_db"] >= VAD_THRESHOLD_DB
                     cv_analysis_cache[cache_key] = {
                         "time": time.time(),
                         "data": analysis_data
@@ -997,6 +1016,7 @@ async def probe(
     metric_is_black = Gauge('onvif_video_is_black_screen', '视频是否黑屏', registry=registry)
     metric_audio_vol = Gauge('onvif_audio_mean_volume_db', '音频平均音量(dB)', registry=registry)
     metric_audio_probe_success = Gauge('onvif_audio_probe_success', '最近一次音频分析是否成功，未分析或失败为0', registry=registry)
+    metric_vad_active = Gauge('onvif_audio_vad_active', '基于音频能量阈值的语音活动状态，启用时1表示活动', registry=registry)
     metric_audio_profile_info = Gauge('onvif_audio_stream_profile_info', '最近成功音频分析使用的ONVIF媒体Profile',
                                       ['token', 'name'], registry=registry)
     metric_cv_brightness = Gauge('onvif_video_cv_brightness', '图像平均亮度', registry=registry)
@@ -1110,6 +1130,7 @@ async def probe(
         metric_is_black.set(1 if analysis_data['is_black'] else 0)
         metric_audio_vol.set(analysis_data['audio_volume_db'])
         metric_audio_probe_success.set(1 if analysis_data['audio_probe_success'] else 0)
+        metric_vad_active.set(1 if ENABLE_VAD and analysis_data['vad_active'] else 0)
         if analysis_data['audio_probe_success']:
             metric_audio_profile_info.labels(token=analysis_data['audio_profile_token'],
                                              name=analysis_data['audio_profile_name']).set(1)
@@ -1204,6 +1225,13 @@ async def metrics():
         f"onvif_exporter_cv_read_attempts {CV_READ_ATTEMPTS}\n"
         f"onvif_exporter_cv_read_retry_delay_seconds {CV_READ_RETRY_DELAY_SECONDS}\n"
         f"onvif_exporter_prefer_h264_stream {1 if PREFER_H264_STREAM else 0}\n"
+        f"onvif_exporter_enable_brightness {1 if ENABLE_BRIGHTNESS else 0}\n"
+        f"onvif_exporter_enable_contrast {1 if ENABLE_CONTRAST else 0}\n"
+        f"onvif_exporter_enable_color_temperature {1 if ENABLE_COLOR_TEMPERATURE else 0}\n"
+        f"onvif_exporter_enable_saturation {1 if ENABLE_SATURATION else 0}\n"
+        f"onvif_exporter_enable_sharpness {1 if ENABLE_SHARPNESS else 0}\n"
+        f"onvif_exporter_enable_vad {1 if ENABLE_VAD else 0}\n"
+        f"onvif_exporter_vad_threshold_db {VAD_THRESHOLD_DB}\n"
         f"onvif_exporter_stream_cache_ttl_seconds {STREAM_CACHE_TTL}\n"
         f"onvif_exporter_analysis_cache_ttl_seconds {ANALYSIS_CACHE_TTL}\n"
         f"onvif_exporter_cv_cache_entries {len(cv_analysis_cache)}\n"
