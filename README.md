@@ -112,7 +112,8 @@ services:
       - ENABLE_SATURATION=true       # 饱和度分析开关
       - ENABLE_SHARPNESS=true        # 清晰度分析开关
       - ENABLE_VAD=false             # 语音活动检测开关（能量阈值 VAD）
-      - VAD_THRESHOLD_DB=-50         # VAD 判定阈值，音量达到该值视为活动
+      - VAD_AGGRESSIVENESS=2         # WebRTC VAD 灵敏度，0-3，越高越严格
+      - VAD_MIN_VOICED_RATIO=0.2     # 20ms 音频帧中判定为语音的最小比例
       # --- 安全控制 (可选) ---
       # - EXPORTER_AUTH_USERNAME=admin
       # - EXPORTER_AUTH_PASSWORD=secret
@@ -179,8 +180,9 @@ CV_WORKER_COUNT=1 CV_WORKER_TASK_LIMIT=1 ONVIF_MAX_CONCURRENCY=4 ./onvif-exporte
 | `ENABLE_COLOR_TEMPERATURE` | `True` | 是否计算色温近似指标（红蓝通道比）；关闭后 `onvif_video_cv_red_blue_ratio` 返回默认值 `1`。 |
 | `ENABLE_SATURATION` | `True` | 是否计算饱和度指标；关闭后返回默认值 `0`。 |
 | `ENABLE_SHARPNESS` | `True` | 是否计算清晰度指标；关闭后返回默认值 `0`。 |
-| `ENABLE_VAD` | `False` | 是否输出语音活动状态。当前实现是轻量能量 VAD：音量达到 `VAD_THRESHOLD_DB` 即记为活动，不区分人声与其他声音。 |
-| `VAD_THRESHOLD_DB` | `-50` | 能量 VAD 阈值（dB）；建议根据现场噪声基线调整。仅在 `ENABLE_VAD=true` 时生效。 |
+| `ENABLE_VAD` | `False` | 是否启用 WebRTC VAD 人声活动检测。它分析 16 kHz、20 ms PCM 帧，不以音量阈值单独判定。 |
+| `VAD_AGGRESSIVENESS` | `2` | WebRTC VAD 严格程度，`0-3`；越高越能抑制噪声，但小声人声可能更容易漏检。 |
+| `VAD_MIN_VOICED_RATIO` | `0.2` | 一个采样窗口内被 WebRTC 判为语音的帧比例达到该值时，`onvif_audio_vad_active=1`。 |
 | `EXPORTER_AUTH_USERNAME` | 未设置 | HTTP Basic Auth 用户名。只有同时设置用户名和密码时才开启鉴权。 |
 | `EXPORTER_AUTH_PASSWORD` | 未设置 | HTTP Basic Auth 密码。开启后 `/probe`、`/control`、`/metrics` 都需要认证，且自动隐藏 `/docs`。 |
 
@@ -364,7 +366,7 @@ curl -u "exporter_user:exporter_password" "http://127.0.0.1:9121/control?target=
 | `onvif_video_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 实际用于 RTSP/CV 分析的 ONVIF 媒体 Profile。默认优先选择 H.264，再在同编码优先级内选择低分辨率 Profile。 |
 | `onvif_audio_stream_profile_info` | Gauge | `/probe` | `token`, `name` | 开发版：最近一次分析中成功测到音量的音频 Profile；没有成功结果时不输出样本。可能与视频 Profile 不同。 |
 | `onvif_audio_probe_success` | Gauge | `/probe` | 无 | 开发版：当前分析缓存中存在成功音量结果为 `1`，待采样或失败为 `0`。结合分析缓存有效性指标判断是否过期。 |
-| `onvif_audio_vad_active` | Gauge | `/probe` | 无 | 语音活动状态；仅在 `ENABLE_VAD=true` 时有效，音量达到 `VAD_THRESHOLD_DB` 返回 `1`。这是能量 VAD，不区分人声和其他声音。 |
+| `onvif_audio_vad_active` | Gauge | `/probe` | 无 | 人声活动状态；仅在 `ENABLE_VAD=true` 时有效，由 WebRTC VAD 对 16 kHz 音频帧判定，不是简单音量阈值。 |
 | `onvif_video_resolution_width` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率宽度。 |
 | `onvif_video_resolution_height` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码分辨率高度。 |
 | `onvif_video_framerate_limit` | Gauge | `/probe` | 无 | 实际用于 RTSP/CV 分析的视频编码帧率上限。 |

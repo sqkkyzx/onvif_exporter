@@ -9,5 +9,6 @@ dependencies = [
     "prometheus-client",
     "onvif-zeep",
     "opencv-python-headless",
-    "ffmpeg-python"
+    "ffmpeg-python",
+    "webrtcvad-wheels==2.0.14",
 ]

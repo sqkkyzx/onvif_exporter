@@ -26,6 +26,11 @@ def candidate(token, uri=None):
 
 
 class AudioProfileTests(unittest.TestCase):
+    def test_webrtc_vad_rejects_silence(self):
+        completed = SimpleNamespace(returncode=0, stdout=b"\0" * (16000 * 2), stderr=b"")
+        with patch.object(main.subprocess, "run", return_value=completed):
+            self.assertFalse(main.detect_voice_activity("rtsp://camera/audio"))
+
     def test_main_stream_audio_does_not_change_video_substream_selection(self):
         main_stream = make_profile("main", 1920, 1080, audio=True)
         substream = make_profile("sub", 640, 360)

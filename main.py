@@ -5,6 +5,7 @@ import tomllib
 
 import cv2
 import ffmpeg
+import webrtcvad
 import os
 import re
 import gc
@@ -119,8 +120,9 @@ ENABLE_COLOR_TEMPERATURE = env_enabled("ENABLE_COLOR_TEMPERATURE")
 ENABLE_SATURATION = env_enabled("ENABLE_SATURATION")
 ENABLE_SHARPNESS = env_enabled("ENABLE_SHARPNESS")
 ENABLE_VAD = env_enabled("ENABLE_VAD", False)
-# 这是基于音频能量的轻量 VAD：平均音量达到阈值即视为有语音/活动音频。
-VAD_THRESHOLD_DB = float(os.getenv("VAD_THRESHOLD_DB", "-50"))
+# WebRTC VAD 使用 16 kHz、20 ms 单声道 PCM 帧，能抑制稳定底噪并识别人声特征。
+VAD_AGGRESSIVENESS = min(3, max(0, int(os.getenv("VAD_AGGRESSIVENESS", "2"))))
+VAD_MIN_VOICED_RATIO = min(1.0, max(0.0, float(os.getenv("VAD_MIN_VOICED_RATIO", "0.2"))))
 
 # --- 鉴权环境变量 ---
 AUTH_USERNAME = os.getenv("EXPORTER_AUTH_USERNAME")
@@ -344,6 +346,30 @@ def detect_audio_volume_db(stream_uri: str) -> float | None:
     return None
 
 
+def detect_voice_activity(stream_uri: str) -> bool | None:
+    """Run WebRTC VAD on a short mono PCM sample; return None on stream errors."""
+    audio_stream = ffmpeg.input(stream_uri, rtsp_transport='tcp', allowed_media_types='audio').audio
+    command = (
+        audio_stream
+        .output('pipe:', format='s16le', ac=1, ar=16000, t=FFMPEG_AUDIO_SAMPLE_SECONDS)
+        .global_args('-nostdin')
+        .compile()
+    )
+    completed = subprocess.run(command, capture_output=True, timeout=FFMPEG_AUDIO_TIMEOUT_SECONDS)
+    if completed.returncode != 0 or not completed.stdout:
+        logger.error("FFmpeg VAD 音频采样失败: %s", format_ffmpeg_error(completed))
+        return None
+
+    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+    frame_bytes = 16000 * 20 // 1000 * 2
+    frames = [completed.stdout[i:i + frame_bytes] for i in range(0, len(completed.stdout), frame_bytes)]
+    frames = [frame for frame in frames if len(frame) == frame_bytes]
+    if not frames:
+        return None
+    voiced = sum(vad.is_speech(frame, 16000) for frame in frames)
+    return voiced / len(frames) >= VAD_MIN_VOICED_RATIO
+
+
 def build_default_analysis_data():
     return {
         "is_black": False,
@@ -487,9 +513,18 @@ def sync_detect_audio_candidates(candidates):
             "elapsed": time.perf_counter() - started
         })
         if volume_db is not None:
+            vad_active = False
+            if ENABLE_VAD:
+                try:
+                    vad_active = bool(detect_voice_activity(candidate["uri"]))
+                except subprocess.TimeoutExpired:
+                    logger.error("FFmpeg VAD 超时: timeout=%ss", FFMPEG_AUDIO_TIMEOUT_SECONDS)
+                except Exception as exc:
+                    logger.error("FFmpeg VAD 异常: %s", exc)
             return {
                 "audio_volume_db": volume_db,
                 "audio_probe_success": True,
+                "vad_active": vad_active,
                 "audio_profile_token": candidate["profile_token"],
                 "audio_profile_name": candidate["profile_name"]
             }, attempts
@@ -938,8 +973,6 @@ async def cv_worker(worker_id: int, slot_id: int):
                     audio_status = "updated"
                     analysis_data = dict(analysis_data)
                     analysis_data.update(audio_result)
-                    if ENABLE_VAD:
-                        analysis_data["vad_active"] = audio_result["audio_volume_db"] >= VAD_THRESHOLD_DB
                     cv_analysis_cache[cache_key] = {
                         "time": time.time(),
                         "data": analysis_data
@@ -1016,7 +1049,7 @@ async def probe(
     metric_is_black = Gauge('onvif_video_is_black_screen', '视频是否黑屏', registry=registry)
     metric_audio_vol = Gauge('onvif_audio_mean_volume_db', '音频平均音量(dB)', registry=registry)
     metric_audio_probe_success = Gauge('onvif_audio_probe_success', '最近一次音频分析是否成功，未分析或失败为0', registry=registry)
-    metric_vad_active = Gauge('onvif_audio_vad_active', '基于音频能量阈值的语音活动状态，启用时1表示活动', registry=registry)
+    metric_vad_active = Gauge('onvif_audio_vad_active', 'WebRTC VAD 人声活动状态，启用时1表示活动', registry=registry)
     metric_audio_profile_info = Gauge('onvif_audio_stream_profile_info', '最近成功音频分析使用的ONVIF媒体Profile',
                                       ['token', 'name'], registry=registry)
     metric_cv_brightness = Gauge('onvif_video_cv_brightness', '图像平均亮度', registry=registry)
@@ -1231,7 +1264,8 @@ async def metrics():
         f"onvif_exporter_enable_saturation {1 if ENABLE_SATURATION else 0}\n"
         f"onvif_exporter_enable_sharpness {1 if ENABLE_SHARPNESS else 0}\n"
         f"onvif_exporter_enable_vad {1 if ENABLE_VAD else 0}\n"
-        f"onvif_exporter_vad_threshold_db {VAD_THRESHOLD_DB}\n"
+        f"onvif_exporter_vad_aggressiveness {VAD_AGGRESSIVENESS}\n"
+        f"onvif_exporter_vad_min_voiced_ratio {VAD_MIN_VOICED_RATIO}\n"
         f"onvif_exporter_stream_cache_ttl_seconds {STREAM_CACHE_TTL}\n"
         f"onvif_exporter_analysis_cache_ttl_seconds {ANALYSIS_CACHE_TTL}\n"
         f"onvif_exporter_cv_cache_entries {len(cv_analysis_cache)}\n"
