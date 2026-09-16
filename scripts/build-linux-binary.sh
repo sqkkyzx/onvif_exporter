@@ -33,6 +33,7 @@ rm -rf build dist release onvif-exporter.spec "${ARCHIVE_NAME}.spec"
   --noconfirm \
   --onefile \
   --name onvif-exporter \
+  --additional-hooks-dir scripts/pyinstaller-hooks \
   --add-data "pyproject.toml:." \
   --collect-all anyio \
   --collect-all fastapi \
